@@ -28,12 +28,11 @@ from typing import Optional
 
 import boto3 as _boto3
 
-try:
-    # CROSS_ACCOUNT_ROLE_NAME is the role assumed in each target account.
-    from config import CROSS_ACCOUNT_ROLE_NAME, AWS_REGION as _DEFAULT_REGION
-except Exception:  # pragma: no cover - config always present in practice
-    CROSS_ACCOUNT_ROLE_NAME = "CloudOpsCrossAccountRole"
-    _DEFAULT_REGION = "us-east-1"
+from config import (
+    AWS_REGION as _DEFAULT_REGION,
+    CROSS_ACCOUNT_EXTERNAL_ID,
+    CROSS_ACCOUNT_ROLE_NAME,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +85,11 @@ _creds_cache: dict = {}
 _EXPIRY_SKEW_SECONDS = 300
 
 
+def base_account_id() -> Optional[str]:
+    """Account id the runtime itself runs in (None if it can't be determined)."""
+    return _base_account_id()
+
+
 def _base_account_id() -> Optional[str]:
     """Account id the runtime itself is running as (cached best-effort)."""
     global _base_account
@@ -115,11 +119,14 @@ def _assume_role_credentials(account_id: str) -> dict:
 
     sts = _boto3.client("sts", region_name=_DEFAULT_REGION)
     role_arn = f"arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}"
-    resp = sts.assume_role(
-        RoleArn=role_arn,
-        RoleSessionName=f"cloudops-agent-{account_id}",
-        DurationSeconds=3600,
-    )
+    params = {
+        "RoleArn": role_arn,
+        "RoleSessionName": f"cloudops-agent-{account_id}",
+        "DurationSeconds": 3600,
+    }
+    if CROSS_ACCOUNT_EXTERNAL_ID:
+        params["ExternalId"] = CROSS_ACCOUNT_EXTERNAL_ID
+    resp = sts.assume_role(**params)
     creds = resp["Credentials"]
     scoped = {
         "aws_access_key_id": creds["AccessKeyId"],

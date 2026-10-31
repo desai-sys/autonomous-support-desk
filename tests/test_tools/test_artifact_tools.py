@@ -2,39 +2,17 @@
 Tests for uploaded-zip deployment: ArtifactService (UI side), artifact_tools
 (agent side), and the entrypoint's account / context handling.
 """
-import importlib
 import io
 import json
-import sys
 import zipfile
 from unittest.mock import MagicMock
 
+import boto3
 import pytest
 
-# Several legacy test modules replace boto3/botocore/structlog in sys.modules with
-# MagicMocks at import time and never restore them. These tests run real boto3
-# against moto, so drop those mocks and re-import the modules under test.
-_MOCKED_ROOTS = [r for r in ("boto3", "botocore", "structlog")
-                 if isinstance(sys.modules.get(r), MagicMock)]
-if _MOCKED_ROOTS:
-    _reimport = set(_MOCKED_ROOTS)
-    if _reimport & {"boto3", "botocore"}:
-        # Real submodules left behind would not attach to a fresh package import.
-        _reimport |= {"boto3", "botocore", "s3transfer", "moto"}
-    for _name in list(sys.modules):
-        if _name.split(".")[0] in _reimport:
-            del sys.modules[_name]
-for _name in ("src.core.aws_clients", "src.tools.deployment_tools",
-              "src.tools.artifact_tools", "src.services.artifact_service"):
-    if _name in sys.modules:
-        importlib.reload(sys.modules[_name])
-
-import boto3  # noqa: E402
-from moto import mock_aws  # noqa: E402
-
-import config  # noqa: E402
-from src.services.artifact_service import ArtifactService, ArtifactValidationError  # noqa: E402
-from src.tools import artifact_tools  # noqa: E402
+import config
+from src.services.artifact_service import ArtifactService, ArtifactValidationError
+from src.tools import artifact_tools
 
 
 def make_zip(files: dict) -> bytes:
@@ -46,15 +24,6 @@ def make_zip(files: dict) -> bytes:
 
 
 PY_LAMBDA = "import json\n\ndef lambda_handler(event, context):\n    return {'ok': True}\n"
-
-
-@pytest.fixture
-def aws(monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    with mock_aws(config={"iam": {"load_aws_managed_policies": True}}):
-        yield
 
 
 @pytest.fixture
@@ -221,36 +190,46 @@ class TestDeployEcsAndStatic:
 
 class TestEntrypointTargeting:
     @pytest.fixture(autouse=True)
-    def entrypoint(self):
+    def entrypoint(self, monkeypatch):
         import src.agentcore_entrypoint as ep
         self.ep = ep
+        monkeypatch.setattr(ep, "base_account_id", lambda: "999999999999")
+        monkeypatch.setattr(ep.account_registry, "list",
+                            lambda: {"111122223333": {}, "444455556666": {}})
 
-    def test_explicit_empty_list_pins_base_account(self):
+    def test_explicit_empty_list_pins_platform_account(self):
         payload = {"account_ids": [], "user_message": "check 111122223333"}
-        assert self.ep._extract_target_accounts(payload, "check 111122223333") == []
+        assert self.ep._resolve_accounts(payload, "check 111122223333") == ([None], [])
 
     def test_explicit_accounts_win(self):
         payload = {"account_ids": ["111122223333", "444455556666"]}
-        assert self.ep._extract_target_accounts(payload, "anything 777788889999") == [
-            "111122223333", "444455556666"]
+        assert self.ep._resolve_accounts(payload, "anything 777788889999") == (
+            ["111122223333", "444455556666"], [])
+
+    def test_unregistered_accounts_are_refused(self):
+        payload = {"account_ids": ["111122223333", "777788889999"]}
+        assert self.ep._resolve_accounts(payload, "") == (["111122223333"], ["777788889999"])
+
+    def test_platform_account_id_maps_to_ambient_credentials(self):
+        assert self.ep._resolve_accounts({"account_ids": ["999999999999"]}, "") == ([None], [])
 
     def test_history_is_not_scanned(self):
-        prompt = ("Conversation so far:\nAssistant: role arn:aws:iam::999988887777:role/x\n\n"
+        prompt = ("Conversation so far:\nAssistant: role arn:aws:iam::111122223333:role/x\n\n"
                   "User: yes go ahead")
-        payload = {"user_message": "yes go ahead"}
-        assert self.ep._extract_target_accounts(payload, prompt) == []
+        assert self.ep._resolve_accounts({"user_message": "yes go ahead"}, prompt) == ([None], [])
 
     def test_latest_message_accounts_still_work_without_explicit_list(self):
         payload = {"user_message": "list buckets in 111122223333"}
-        assert self.ep._extract_target_accounts(payload, "") == ["111122223333"]
+        assert self.ep._resolve_accounts(payload, "") == (["111122223333"], [])
 
-    def test_context_notes_include_artifact_and_region(self):
+    def test_context_notes_include_artifact_region_and_read_only(self):
         notes = self.ep._build_context_notes(
             {"uri": "s3://b/uploads/t/x/app.zip", "filename": "app.zip", "target": "lambda",
              "options": {"function_name": "f"}},
-            "eu-west-1",
+            "eu-west-1", read_only=True,
         )
         joined = "\n".join(notes)
+        assert "READ-ONLY SESSION" in joined
         assert "region='eu-west-1'" in joined
         assert "artifact_uri: s3://b/uploads/t/x/app.zip" in joined
         assert "requested target: lambda" in joined
@@ -259,12 +238,25 @@ class TestEntrypointTargeting:
         captured = {}
         monkeypatch.setattr(self.ep.router, "route", lambda *a, **k: ["storage"])
 
-        def fake_run(prompt, domains, history=None, context_notes=None):
+        def fake_run(prompt, domains, notes, gate, read_only=False):
             captured["domains"] = domains
             return "ok", domains, 1
         monkeypatch.setattr(self.ep, "_run_agent_with_domains", fake_run)
-        self.ep._resolve_query("deploy it", "auto", [], [], has_artifact=True)
+        self.ep._resolve_query("deploy it", "auto", [], [], MagicMock(queued=[]), has_artifact=True)
         assert captured["domains"] == ["storage", "deployment"]
+
+    def test_read_only_runs_load_no_mutating_tools(self, monkeypatch):
+        seen = {}
+
+        class FakeAgent:
+            def __init__(self, tools, **kwargs):
+                seen["tools"] = [t.tool_name for t in tools]
+
+            def __call__(self, prompt):
+                return "ok"
+        monkeypatch.setattr(self.ep, "Agent", FakeAgent)
+        self.ep._run_agent_with_domains("hi", ["compute", "deployment"], [], MagicMock(), read_only=True)
+        assert seen["tools"] and not [t for t in seen["tools"] if self.ep.is_mutating(t)]
 
 
 class TestEc2Script:

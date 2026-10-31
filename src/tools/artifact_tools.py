@@ -39,10 +39,7 @@ from src.tools.deployment_tools import (
     _generate_default_name,
 )
 
-try:
-    from config import ARTIFACT_BUCKET, MAX_ARTIFACT_MB, AWS_REGION as _ARTIFACT_REGION
-except Exception:  # pragma: no cover - config always present in practice
-    ARTIFACT_BUCKET, MAX_ARTIFACT_MB, _ARTIFACT_REGION = "", 200, "us-east-1"
+from config import ARTIFACT_BUCKET, MAX_ARTIFACT_MB, AWS_REGION as _ARTIFACT_REGION
 
 logger = structlog.get_logger()
 
@@ -807,7 +804,7 @@ def deploy_artifact_to_ecs(
         if missing:
             return _fail(
                 "missing_prerequisite", f"Required IAM role(s) missing in this account: {', '.join(missing)}.",
-                "Deploy deployment/cross_account_role.yaml (CreateDeploymentRoles=true) in this account.",
+                "Deploy infra/cross_account_role.yaml (CreateDeploymentRoles=true) in this account.",
             )
         _ensure_staging_bucket(_account_id(region), region)
     except Exception as e:

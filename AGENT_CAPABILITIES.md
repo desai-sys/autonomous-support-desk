@@ -1,6 +1,11 @@
 # CloudOps Agent — Full Capabilities Reference
 
-Use these queries in the Command Center (default: http://localhost:8501, or your deployed EC2/App Runner URL) to test.
+Example requests for the Command Center (your console URL from `scripts/deploy.py`).
+
+Read-only requests (list, analyze, get, describe, ...) run immediately. Requests that change
+something (start, stop, modify, create, delete, deploy, rollback, ...) are investigated and then
+queued as **changes awaiting approval**: each shows the exact tool call, account and region, and
+runs only when an operator, SRE or admin clicks **Approve**. Viewers get read-only answers.
 
 ---
 
@@ -330,13 +335,12 @@ Use these queries in the Command Center (default: http://localhost:8501, or your
 
 ## Targeting a Specific Account
 
-By default every query acts on the account the agent runs in. In the Command
-Center, choose the account(s) in the sidebar's **Target Accounts** picker (or
-type a 12-digit account ID in the message; it is added to the picker so follow-up
-confirmations stay on that account). API callers pass `account_id` / `account_ids`
-in the invoke payload. The agent assumes the `CloudOpsCrossAccountRole` in that
-account and states which account it acted on in its report. Pick several accounts
-to fan out across all of them.
+By default every request acts on the platform account (where the agent runs). In the
+Command Center, choose accounts in the sidebar's **Target accounts** picker, or type a
+registered 12-digit account ID in the message; it is added to the picker so follow-ups
+stay on that account. Only accounts an admin registered on the **Accounts** page can be
+targeted. The agent assumes `CloudOpsCrossAccountRole` there and states which account it
+acted on. Pick several accounts to fan out across all of them.
 
 | Action | Sample Query |
 |--------|-------------|
@@ -349,7 +353,7 @@ to fan out across all of them.
 ## Deploying an Uploaded Zip
 
 Use **📦 Deploy code (.zip)** above the chat to upload a zip and pick a target; the
-agent inspects it, shows a plan, and deploys after you confirm.
+agent inspects it, shows a plan, and queues the deployment for your approval.
 
 | Action | Sample Query (after uploading) |
 |--------|-------------|

@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudOps cross-account access. Deploy in every AWS account the CloudOps agent
+  should manage (or across an AWS Organization as a StackSet). Creates the role
+  the agent assumes plus, optionally, the service roles its deploy tools use.
+  The platform's values for both required parameters are shown on the console's
+  Accounts page and printed by scripts/deploy.py.
+
+Parameters:
+  AgentRuntimeRoleArn:
+    Type: String
+    Description: >
+      ARN of the IAM role the CloudOps agent runtime runs as in the platform
+      account (app stack output AgentRuntimeRoleArn).
+    AllowedPattern: "^arn:aws:iam::\\d{12}:role/.+$"
+  ExternalId:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >
+      Shared value the agent must present when assuming the role (Secrets Manager
+      secret <AppName>/cross-account-external-id in the platform account).
+  RoleName:
+    Type: String
+    Default: CloudOpsCrossAccountRole
+    Description: Must match CROSS_ACCOUNT_ROLE_NAME in config.py.
+  AccessLevel:
+    Type: String
+    Default: PowerUser
+    AllowedValues: [PowerUser, ReadOnly]
+    Description: >
+      PowerUser lets the agent change resources and deploy code (after your
+      confirmation in chat). ReadOnly limits it to inspection.
+  CreateDeploymentRoles:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Create the service roles used by the deploy tools (Lambda execution,
+      CodeBuild, ECS task execution, EC2 SSM instance profile).
+
+Conditions:
+  IsPowerUser: !Equals [!Ref AccessLevel, PowerUser]
+  MakeDeploymentRoles: !Equals [!Ref CreateDeploymentRoles, "true"]
+
+Resources:
+  CrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Assumed by the CloudOps agent to act in this account.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref AgentRuntimeRoleArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      ManagedPolicyArns: !If
+        - IsPowerUser
+        - - arn:aws:iam::aws:policy/PowerUserAccess
+          - arn:aws:iam::aws:policy/IAMReadOnlyAccess
+        - - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Tags:
+        - Key: ManagedBy
+          Value: CloudOps
+
+  # PowerUserAccess excludes IAM. The deploy tools only need to create, tag and
+  # pass their own CloudOps service roles, so IAM writes are limited to those names.
+  CloudOpsIamPolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsPowerUser
+    Properties:
+      PolicyName: CloudOpsDeploymentIam
+      Roles: [!Ref CrossAccountRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ManageCloudOpsServiceRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:TagRole
+              - iam:AttachRolePolicy
+              - iam:PassRole
+              - iam:CreateInstanceProfile
+              - iam:AddRoleToInstanceProfile
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/cloudops-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/CloudOps*
+              - !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/CloudOps*
+          - Sid: AllowOnlyBasicPoliciesOnCloudOpsRoles
+            Effect: Deny
+            Action: iam:AttachRolePolicy
+            Resource: "*"
+            Condition:
+              ArnNotEquals:
+                iam:PolicyARN:
+                  - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                  - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                  - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: MakeDeploymentRoles
+    Properties:
+      RoleName: cloudops-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags: [{Key: ManagedBy, Value: CloudOps}]
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: MakeDeploymentRoles
+    Properties:
+      RoleName: cloudops-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CreateLogGroups
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/ecs/*
+      Tags: [{Key: ManagedBy, Value: CloudOps}]
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: MakeDeploymentRoles
+    Properties:
+      RoleName: cloudops-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudOpsContainerBuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub arn:aws:s3:::cloudops-deployments-${AWS::AccountId}/*
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !Sub arn:aws:ecr:*:${AWS::AccountId}:repository/*
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/codebuild/*
+      Tags: [{Key: ManagedBy, Value: CloudOps}]
+
+  Ec2SsmRole:
+    Type: AWS::IAM::Role
+    Condition: MakeDeploymentRoles
+    Properties:
+      RoleName: CloudOpsEC2SSMRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags: [{Key: ManagedBy, Value: CloudOps}]
+
+  Ec2SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: MakeDeploymentRoles
+    Properties:
+      InstanceProfileName: CloudOpsEC2SSMRole
+      Roles: [!Ref Ec2SsmRole]
+
+Outputs:
+  CrossAccountRoleArn:
+    Value: !GetAtt CrossAccountRole.Arn

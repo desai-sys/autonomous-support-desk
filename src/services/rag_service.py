@@ -1,67 +1,54 @@
 """
-RAG service for CloudOps platform.
+Knowledge-base lookups over resolved tickets (Bedrock Knowledge Base).
+
+Every document carries a ``tenant_id`` metadata attribute (written by the
+learning loop) and every query filters on it, so tenants never see each
+other's resolutions.
 """
 
 import boto3
+import structlog
+
+import config
 from src.models.query import Query, Resolution
-from config import KNOWLEDGE_BASE_ID, AWS_REGION
+
+logger = structlog.get_logger()
 
 
 class RAGService:
-    """Service for RAG operations."""
-    
     def __init__(self):
-        self.client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
-        self.knowledge_base_id = KNOWLEDGE_BASE_ID
+        self.client = boto3.client("bedrock-agent-runtime", region_name=config.AWS_REGION)
+        self.knowledge_base_id = config.KNOWLEDGE_BASE_ID
 
     def resolve(self, query: Query) -> Resolution:
-        """Resolve query using RAG."""
-        if self.knowledge_base_id == 'PLACEHOLDER':
-            return Resolution(
-                text="Knowledge Base not configured. Please complete the setup.",
-                resolution_type="error",
-                confidence=0.0,
-                escalate=True
-            )
-        
+        if not self.knowledge_base_id:
+            return Resolution(text="The knowledge base is not configured.",
+                              resolution_type="error", confidence=0.0, escalate=True)
         try:
             response = self.client.retrieve(
                 knowledgeBaseId=self.knowledge_base_id,
-                retrievalQuery={'text': query.text}
+                retrievalQuery={"text": query.text},
+                retrievalConfiguration={"vectorSearchConfiguration": {
+                    "numberOfResults": 3,
+                    "filter": {"equals": {"key": "tenant_id", "value": query.customer_id}},
+                }},
             )
-            results = response.get('retrievalResults', [])
-
-            if not results:
-                return Resolution(
-                    text="No known resolution found in history. Escalating to human SRE.",
-                    resolution_type="escalated",
-                    confidence=0.0,
-                    escalate=True
-                )
-
-            top = results[0]
-            score = top.get('score', 0)
-            top_text = top['content']['text']
-
-            if score < 0.6:
-                return Resolution(
-                    text="No high-confidence resolution found in history. Escalating to human SRE.",
-                    resolution_type="escalated",
-                    confidence=0.0,
-                    escalate=True
-                )
-
-            return Resolution(
-                text=f"Based on historical resolutions:\n\n{top_text}",
-                resolution_type="rag",
-                confidence=score,
-                escalate=False
-            )
-            
         except Exception as e:
-            return Resolution(
-                text=f"RAG service error: {str(e)}",
-                resolution_type="error",
-                confidence=0.0,
-                escalate=True
-            )
+            logger.error("rag_retrieve_failed", error=str(e))
+            return Resolution(text=f"Knowledge base error: {e}", resolution_type="error",
+                              confidence=0.0, escalate=True)
+
+        results = [r for r in response.get("retrievalResults", [])
+                   if r.get("score", 0) >= config.RAG_MIN_SCORE]
+        if not results:
+            return Resolution(text="No matching resolution found in past tickets.",
+                              resolution_type="escalated", confidence=0.0, escalate=True)
+
+        best = results[0]
+        parts = [r["content"]["text"].strip() for r in results]
+        return Resolution(
+            text="Based on past resolutions:\n\n" + "\n\n---\n\n".join(parts),
+            resolution_type="rag",
+            confidence=min(1.0, float(best.get("score", 0))),
+            escalate=False,
+        )

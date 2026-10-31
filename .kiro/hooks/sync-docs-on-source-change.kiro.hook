@@ -1,19 +1,19 @@
 {
   "enabled": true,
   "name": "Sync Docs on Source Change",
-  "description": "Watches Python source files and config files for changes, then asks the agent to update README.md, AGENT_CAPABILITIES.md, DEPLOYMENT_GUIDE.md, and deployment/deploy_agentcore.md to reflect any relevant documentation changes.",
+  "description": "Watches source, config and infrastructure files and asks the agent to update README.md, AGENT_CAPABILITIES.md, docs/DEPLOYMENT.md and docs/ARCHITECTURE.md where the change affects them.",
   "version": "1",
   "when": {
     "type": "fileEdited",
     "patterns": [
       "**/*.py",
-      "requirements.txt",
-      ".bedrock_agentcore.yaml"
+      "infra/*.yaml",
+      "requirements/*.txt"
     ]
   },
   "then": {
     "type": "askAgent",
-    "prompt": "A source file was just edited. Review the changes and update README.md, AGENT_CAPABILITIES.md, DEPLOYMENT_GUIDE.md, and deployment/deploy_agentcore.md to reflect any relevant documentation changes such as new features, updated APIs, changed configuration, or modified behavior. Only update sections that are actually affected by the change. Do not rewrite unrelated sections."
+    "prompt": "A source file was just edited. Review the change and update README.md, AGENT_CAPABILITIES.md, docs/DEPLOYMENT.md and docs/ARCHITECTURE.md only where they are affected (new features, changed configuration, infrastructure or behaviour). If the architecture changed, update docs/architecture.py and regenerate docs/architecture.png. Do not rewrite unrelated sections."
   },
   "workspaceFolderName": "autonomous-support-desk",
   "shortName": "sync-docs-on-source-change"

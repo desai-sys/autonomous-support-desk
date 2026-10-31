@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudOps platform foundation: data stores, knowledge base, identity, secrets
+  and the console image build. Deployed first by scripts/deploy.py; infra/app.yaml
+  consumes its outputs.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: cloudops
+    AllowedPattern: "^[a-z][a-z0-9]{2,15}$"
+    Description: Lowercase letters and digits; prefixes every resource name.
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Bedrock embedding model for the knowledge base (1024 dimensions).
+
+Resources:
+  # ── Buckets ────────────────────────────────────────────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-uploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
+          - Id: expire-build-sources
+            Status: Enabled
+            Prefix: builds/
+            ExpirationInDays: 30
+          - Id: expire-old-agent-packages
+            Status: Enabled
+            Prefix: agent/
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  KnowledgeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-knowledge-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+
+  KnowledgeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KnowledgeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt KnowledgeBucket.Arn, !Sub "${KnowledgeBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  # ── DynamoDB ───────────────────────────────────────────────────────────────
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AppName}-tickets"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: ticket_id, AttributeType: S}
+        - {AttributeName: tenant_id, AttributeType: S}
+        - {AttributeName: created_at, AttributeType: S}
+        - {AttributeName: pending_vectorization, AttributeType: S}
+      KeySchema: [{AttributeName: ticket_id, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: by-tenant
+          KeySchema:
+            - {AttributeName: tenant_id, KeyType: HASH}
+            - {AttributeName: created_at, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: pending-vectorization
+          KeySchema: [{AttributeName: pending_vectorization, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AppName}-audit"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tenant_id, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tenant_id, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  ActionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-actions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: action_id, AttributeType: S}
+        - {AttributeName: session_id, AttributeType: S}
+      KeySchema: [{AttributeName: action_id, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: by-session
+          KeySchema: [{AttributeName: session_id, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-accounts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: account_id, AttributeType: S}]
+      KeySchema: [{AttributeName: account_id, KeyType: HASH}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  UsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-usage"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: tenant_id, AttributeType: S}
+        - {AttributeName: period, AttributeType: S}
+      KeySchema:
+        - {AttributeName: tenant_id, KeyType: HASH}
+        - {AttributeName: period, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  # ── Knowledge base (Bedrock KB on S3 Vectors) ──────────────────────────────
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub "${AppName}-vectors-${AWS::AccountId}"
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      IndexName: resolutions
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        # Bedrock stores chunk text here; keeping it non-filterable avoids the
+        # filterable-metadata size limit. tenant_id stays filterable.
+        NonFilterableMetadataKeys: [AMAZON_BEDROCK_TEXT, AMAZON_BEDROCK_METADATA]
+
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}
+      Policies:
+        - PolicyName: knowledge-base
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt KnowledgeBucket.Arn, !Sub "${KnowledgeBucket.Arn}/*"]
+              - Effect: Allow
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:GetIndex
+                Resource: !GetAtt VectorIndex.IndexArn
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub "${AppName}-resolutions"
+      Description: Resolutions of escalated CloudOps tickets.
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt VectorIndex.IndexArn
+
+  KnowledgeDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: resolutions
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt KnowledgeBucket.Arn
+          InclusionPrefixes: [resolutions/]
+
+  # ── Identity (Amazon Cognito) ──────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AppName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: Your CloudOps console account
+          EmailMessage: "You have been invited to the CloudOps console. Username: {username} Temporary password: {####}"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: "OPTIONAL"
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{Name: verified_email, Priority: 1}]
+      Schema:
+        - {Name: email, AttributeDataType: String, Required: true, Mutable: true}
+        - Name: tenant_id
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints: {MinLength: "1", MaxLength: "64"}
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub
+        - "${AppName}-${Suffix}"
+        - Suffix: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+      ManagedLoginVersion: 2
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {UserPoolId: !Ref UserPool, GroupName: admin, Precedence: 1,
+                 Description: "Full access including account registration"}
+  SreGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {UserPoolId: !Ref UserPool, GroupName: sre, Precedence: 2,
+                 Description: "Approve changes, resolve tickets, view audit log"}
+  OperatorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {UserPoolId: !Ref UserPool, GroupName: operator, Precedence: 3,
+                 Description: "Use the agent, upload code, approve changes"}
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {UserPoolId: !Ref UserPool, GroupName: viewer, Precedence: 4,
+                 Description: "Read-only agent access"}
+
+  # ── Generated secrets ──────────────────────────────────────────────────────
+  ExternalIdSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/cross-account-external-id"
+      Description: sts:ExternalId required by CloudOpsCrossAccountRole in managed accounts.
+      GenerateSecretString: {PasswordLength: 32, ExcludePunctuation: true}
+
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/origin-verify"
+      Description: Header value CloudFront sends so the load balancer only accepts CloudFront traffic.
+      GenerateSecretString: {PasswordLength: 48, ExcludePunctuation: true}
+
+  CookieSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/console-cookie-secret"
+      Description: Signs the console's login cookie.
+      GenerateSecretString: {PasswordLength: 48, ExcludePunctuation: true}
+
+  # ── Console image build (CodeBuild, ARM64) ─────────────────────────────────
+  ConsoleRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}/console"
+      ImageScanningConfiguration: {ScanOnPush: true}
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      EncryptionConfiguration: {EncryptionType: AES256}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "Keep the last 20 images",
+            "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 20},
+            "action": {"type": "expire"}}]}
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: console-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${ArtifactBucket.Arn}/builds/*"
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !GetAtt ConsoleRepository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AppName}-console-build*"
+
+  ConsoleBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AppName}-console-build"
+      Description: Builds the console container image from a source zip in the artifact bucket.
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: {Type: NO_ARTIFACTS}
+      TimeoutInMinutes: 30
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - {Name: REPOSITORY_URI, Value: !GetAtt ConsoleRepository.RepositoryUri}
+          - {Name: IMAGE_TAG, Value: latest}
+      Source:
+        Type: S3
+        Location: !Sub "${ArtifactBucket}/builds/console-source.zip"
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${REPOSITORY_URI%%/*}"
+            build:
+              commands:
+                - docker build -t "$REPOSITORY_URI:$IMAGE_TAG" .
+            post_build:
+              commands:
+                - test "$CODEBUILD_BUILD_SUCCEEDING" = 1 && docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      LogsConfig:
+        CloudWatchLogs: {Status: ENABLED, GroupName: !Sub "/aws/codebuild/${AppName}-console-build"}
+
+Outputs:
+  ArtifactBucketName: {Value: !Ref ArtifactBucket}
+  KnowledgeBucketName: {Value: !Ref KnowledgeBucket}
+  TicketsTableName: {Value: !Ref TicketsTable}
+  AuditTableName: {Value: !Ref AuditTable}
+  ActionsTableName: {Value: !Ref ActionsTable}
+  AccountsTableName: {Value: !Ref AccountsTable}
+  UsageTableName: {Value: !Ref UsageTable}
+  KnowledgeBaseId: {Value: !Ref KnowledgeBase}
+  DataSourceId: {Value: !GetAtt KnowledgeDataSource.DataSourceId}
+  KnowledgeBaseArn: {Value: !GetAtt KnowledgeBase.KnowledgeBaseArn}
+  UserPoolId: {Value: !Ref UserPool}
+  UserPoolArn: {Value: !GetAtt UserPool.Arn}
+  UserPoolDomain: {Value: !Ref UserPoolDomain}
+  ExternalIdSecretArn: {Value: !Ref ExternalIdSecret}
+  OriginVerifySecretArn: {Value: !Ref OriginVerifySecret}
+  CookieSecretArn: {Value: !Ref CookieSecret}
+  ConsoleRepositoryUri: {Value: !GetAtt ConsoleRepository.RepositoryUri}
+  ConsoleRepositoryArn: {Value: !GetAtt ConsoleRepository.Arn}
+  ConsoleBuildProject: {Value: !Ref ConsoleBuild}
