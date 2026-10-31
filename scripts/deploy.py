@@ -36,9 +36,9 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
 AGENT_SOURCES = ["agent_main.py", "config.py", "src"]
-CONSOLE_SOURCES = ["Dockerfile", "config.py", "src", "ui", "requirements/console.txt",
-                   ".streamlit/config.toml", "infra/cross_account_role.yaml"]
-SKIP_PARTS = {"__pycache__", ".pytest_cache"}
+CONSOLE_SOURCES = ["Dockerfile", "config.py", "src", "console", "web", "requirements/console.txt",
+                   "infra/cross_account_role.yaml"]
+SKIP_PARTS = {"__pycache__", ".pytest_cache", "node_modules", "dist", "static"}
 
 
 def log(msg: str) -> None:
@@ -309,7 +309,7 @@ def main() -> None:
         "Environment": args.environment,
         **{k: foundation[k] for k in (
             "ArtifactBucketName", "KnowledgeBucketName", "TicketsTableName", "AuditTableName",
-            "ActionsTableName", "AccountsTableName", "UsageTableName", "KnowledgeBaseId",
+            "ActionsTableName", "AccountsTableName", "UsageTableName", "JobsTableName", "KnowledgeBaseId",
             "KnowledgeBaseArn", "DataSourceId", "UserPoolId", "UserPoolDomain", "CookieSecretArn",
             "ConsoleRepositoryUri")},
         "ConsoleImageTag": image_tag,

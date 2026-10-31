@@ -39,6 +39,7 @@ USAGE_TABLE = _env("USAGE_TABLE", "CloudOpsUsage")
 AUDIT_TABLE = _env("AUDIT_TABLE", "CloudOpsAuditLog")
 ACTIONS_TABLE = _env("ACTIONS_TABLE", "CloudOpsActions")
 ACCOUNTS_TABLE = _env("ACCOUNTS_TABLE", "CloudOpsAccounts")
+JOBS_TABLE = _env("JOBS_TABLE", "CloudOpsJobs")
 
 # ── Knowledge base (RAG over resolved tickets) ────────────────────────────────
 S3_BUCKET_NAME = _env("KB_BUCKET", "")
@@ -84,6 +85,12 @@ MAX_ARTIFACT_MB = _env_int("MAX_ARTIFACT_MB", 200)
 # "oidc": sign in with Amazon Cognito (production).
 # "local": pick any identity on a form; for local development only.
 AUTH_MODE = _env("AUTH_MODE", "local")
+OIDC_CLIENT_ID = _env("OIDC_CLIENT_ID", "")
+OIDC_CLIENT_SECRET = _env("OIDC_CLIENT_SECRET", "")
+OIDC_METADATA_URL = _env("OIDC_METADATA_URL", "")
+OIDC_REDIRECT_URI = _env("OIDC_REDIRECT_URI", "")
+OIDC_LOGOUT_URL = _env("OIDC_LOGOUT_URL", "")     # Cognito /logout URL incl. client_id + logout_uri
+SESSION_SECRET = _env("OIDC_COOKIE_SECRET", "dev-only-insecure-secret")
 DEFAULT_TENANT_ID = _env("DEFAULT_TENANT_ID", "default")
 
 # ── Learning loop ─────────────────────────────────────────────────────────────

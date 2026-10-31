@@ -317,7 +317,20 @@ python agent_main.py
 Then, in another terminal, start the console with the development sign-in:
 
 ```bash
-AUTH_MODE=local AGENT_ENDPOINT_URL=http://localhost:8080 streamlit run ui/app.py
+AUTH_MODE=local AGENT_ENDPOINT_URL=http://localhost:8080 uvicorn console.server:app --port 8090
+```
+
+Build the web app once so the console server can serve it:
+
+```bash
+cd web && npm ci && npm run build
+```
+
+Then open http://localhost:8090. To work on the frontend with instant reloads, run the Vite dev
+server instead (it proxies the API to the console on port 8090) and open http://localhost:5173:
+
+```bash
+cd web && npm run dev
 ```
 
 Set the table, bucket and knowledge-base environment variables from

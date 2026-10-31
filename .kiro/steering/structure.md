@@ -9,7 +9,8 @@ src/core/                  approvals.py, accounts.py, aws_clients.py, security.p
 src/services/              ticket_service.py, rag_service.py, artifact_service.py
 src/jobs/learning_loop.py  Hourly knowledge-base sync (scheduled ECS task)
 src/tools/                 @tool functions in seven domains; import boto3 from src.core.aws_clients
-ui/                        Streamlit console: app.py, auth.py, navigation.py, views/
+console/                   FastAPI console server: server.py, auth.py (OIDC/dev), api.py (/api/*), jobs.py
+web/                       React + TypeScript + Tailwind app (pages/, components/); built into console/static
 infra/                     foundation.yaml, app.yaml, cross_account_role.yaml
 scripts/                   deploy.py, destroy.py
 docs/                      DEPLOYMENT.md, ARCHITECTURE.md, architecture.py (diagram)

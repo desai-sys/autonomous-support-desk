@@ -21,6 +21,7 @@ Parameters:
   ActionsTableName: {Type: String}
   AccountsTableName: {Type: String}
   UsageTableName: {Type: String}
+  JobsTableName: {Type: String}
   KnowledgeBaseId: {Type: String}
   KnowledgeBaseArn: {Type: String}
   DataSourceId: {Type: String}
@@ -319,8 +320,8 @@ Resources:
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 8501
-          ToPort: 8501
+          FromPort: 8080
+          ToPort: 8080
           SourceSecurityGroupId: !Ref AlbSecurityGroup
 
   LoadBalancer:
@@ -338,16 +339,12 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       Protocol: HTTP
-      Port: 8501
+      Port: 8080
       TargetType: ip
-      HealthCheckPath: /_stcore/health
+      HealthCheckPath: /healthz
       HealthCheckIntervalSeconds: 15
       HealthyThresholdCount: 2
       TargetGroupAttributes:
-        # Streamlit keeps session state in the task, so pin each browser to one task.
-        - {Key: stickiness.enabled, Value: "true"}
-        - {Key: stickiness.type, Value: lb_cookie}
-        - {Key: stickiness.lb_cookie.duration_seconds, Value: "86400"}
         - {Key: deregistration_delay.timeout_seconds, Value: "30"}
 
   Listener:
@@ -433,6 +430,7 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsageTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${JobsTableName}"
               - Sid: Uploads
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject]
@@ -470,7 +468,7 @@ Resources:
           Image: !Sub "${ConsoleRepositoryUri}:${ConsoleImageTag}"
           Essential: true
           ReadonlyRootFilesystem: false
-          PortMappings: [{ContainerPort: 8501, Protocol: tcp}]
+          PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
           Environment:
             - {Name: CLOUDOPS_ENV, Value: !Ref Environment}
             - {Name: AUTH_MODE, Value: oidc}
@@ -481,6 +479,7 @@ Resources:
             - {Name: ACTIONS_TABLE, Value: !Ref ActionsTableName}
             - {Name: ACCOUNTS_TABLE, Value: !Ref AccountsTableName}
             - {Name: USAGE_TABLE, Value: !Ref UsageTableName}
+            - {Name: JOBS_TABLE, Value: !Ref JobsTableName}
             - {Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucketName}
             - {Name: KB_BUCKET, Value: !Ref KnowledgeBucketName}
             - {Name: KNOWLEDGE_BASE_ID, Value: !Ref KnowledgeBaseId}
@@ -492,6 +491,9 @@ Resources:
             - {Name: OIDC_METADATA_URL, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration"}
             - {Name: OIDC_REDIRECT_URI, Value: !Sub
                 ["https://${Host}/oauth2callback", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]}
+            - {Name: OIDC_LOGOUT_URL, Value: !Sub
+                ["https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/logout?client_id=${OidcClient}&logout_uri=https://${Host}/",
+                 {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]}
           Secrets:
             - {Name: OIDC_CLIENT_SECRET, ValueFrom: !Ref OidcClientSecret}
             - {Name: OIDC_COOKIE_SECRET, ValueFrom: !Ref CookieSecretArn}
@@ -521,7 +523,7 @@ Resources:
           Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
           SecurityGroups: [!Ref ConsoleSecurityGroup]
       LoadBalancers:
-        - {ContainerName: console, ContainerPort: 8501, TargetGroupArn: !Ref ConsoleTargetGroup}
+        - {ContainerName: console, ContainerPort: 8080, TargetGroupArn: !Ref ConsoleTargetGroup}
 
   ConsoleScalableTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
@@ -680,6 +682,7 @@ Resources:
             - {Name: ACTIONS_TABLE, Value: !Ref ActionsTableName}
             - {Name: ACCOUNTS_TABLE, Value: !Ref AccountsTableName}
             - {Name: USAGE_TABLE, Value: !Ref UsageTableName}
+            - {Name: JOBS_TABLE, Value: !Ref JobsTableName}
             - {Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucketName}
             - {Name: KB_BUCKET, Value: !Ref KnowledgeBucketName}
             - {Name: KNOWLEDGE_BASE_ID, Value: !Ref KnowledgeBaseId}
@@ -691,6 +694,9 @@ Resources:
             - {Name: OIDC_METADATA_URL, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration"}
             - {Name: OIDC_REDIRECT_URI, Value: !Sub
                 ["https://${Host}/oauth2callback", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]}
+            - {Name: OIDC_LOGOUT_URL, Value: !Sub
+                ["https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/logout?client_id=${OidcClient}&logout_uri=https://${Host}/",
+                 {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]}
           LogConfiguration:
             LogDriver: awslogs
             Options:

@@ -2,6 +2,8 @@
 # matters for manual `docker build .` runs.
 **/__pycache__
 **/*.py[cod]
+**/node_modules
+web/dist
 .git
 .venv
 venv
@@ -9,4 +11,3 @@ build
 .deploy
 tests
 docs
-.streamlit/secrets.toml

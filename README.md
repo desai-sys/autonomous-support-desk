@@ -28,10 +28,22 @@ proposes waits for a person to approve the exact call before anything runs.**
   changes and it ships a new version.
 - **Learns from people.** Requests the agent can't handle become tickets.
   Resolutions feed a tenant-filtered Bedrock knowledge base every hour.
+- **A console that's a pleasure to use.** A fast React app with dark and light themes, an
+  animated agent that shows what it's doing, suggested prompts, rich approval cards with a
+  code viewer for generated apps, drag-and-drop uploads, a Ctrl+K command palette, and a
+  little confetti when a change lands.
 - **Production foundations.** Cognito sign-in with role groups and MFA;
   CloudFront, WAF and a private ECS console; an audit log of every action;
   CloudWatch alarms and a dashboard; everything defined in CloudFormation and
   deployed with one command.
+
+## Screenshots
+
+| Command Center | Approving a change |
+|---|---|
+| ![Command Center](docs/screenshots/command-center.png) | ![Approval card](docs/screenshots/approval.png) |
+| **Reviewing a generated app** | **Light theme** |
+| ![Generated app review](docs/screenshots/app-review.png) | ![Light theme](docs/screenshots/light-theme.png) |
 
 ## Deploy
 
@@ -74,7 +86,8 @@ src/
   services/                Tickets, knowledge-base retrieval, code-upload staging
   jobs/learning_loop.py    Hourly knowledge-base sync
   tools/                   285 AWS tools in seven domains (+ uploaded-zip deployment)
-ui/                        Streamlit console (Cognito sign-in, pages by role)
+console/                   Console API server (FastAPI: Cognito sign-in, JSON API, background jobs)
+web/                       Console web app (React + TypeScript + Tailwind, built into the image)
 infra/                     CloudFormation: foundation.yaml, app.yaml, cross_account_role.yaml
 scripts/                   deploy.py, destroy.py
 docs/                      Guides and the architecture diagram source
