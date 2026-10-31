@@ -40,7 +40,7 @@ with Diagram("CloudOps Command Center — AWS architecture", filename=str(OUT), 
         with Cluster("VPC (2 AZs)"):
             alb = ALB("ALB\nCloudFront-only")
             with Cluster("ECS Fargate (private subnets)"):
-                console = Fargate("Console\nStreamlit")
+                console = Fargate("Console\nReact + FastAPI")
                 loop = Fargate("Learning loop\n(hourly task)")
         scheduler = EventbridgeScheduler("Scheduler")
 

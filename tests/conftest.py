@@ -53,6 +53,7 @@ def tables(aws):
         "${AppName}-tickets": config.TICKETS_TABLE, "${AppName}-audit": config.AUDIT_TABLE,
         "${AppName}-actions": config.ACTIONS_TABLE, "${AppName}-accounts": config.ACCOUNTS_TABLE,
         "${AppName}-usage": config.USAGE_TABLE,
+        "${AppName}-jobs": config.JOBS_TABLE,
     }
     ddb = boto3.client("dynamodb", region_name="us-east-1")
     for props in _foundation_tables():

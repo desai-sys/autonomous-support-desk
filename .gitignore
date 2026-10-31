@@ -23,8 +23,10 @@ env/
 build/
 .deploy/
 
-# Streamlit OIDC secrets (written by ui/serve.py at container start)
-.streamlit/secrets.toml
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/
+console/static/
 
 
 # Editor / OS

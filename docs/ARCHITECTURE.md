@@ -9,7 +9,7 @@ it with `python docs/architecture.py`, which needs Graphviz.
 
 | Component | Runs on | Code | Responsibility |
 |---|---|---|---|
-| Console | ECS Fargate behind ALB + CloudFront | `ui/` | Sign-in (Cognito OIDC), chat, account and region targeting, code upload, approval cards, tickets, account registry, audit log |
+| Console | ECS Fargate behind ALB + CloudFront | `console/` (FastAPI), `web/` (React) | Sign-in (Cognito OIDC, signed session cookie), chat, account and region targeting, code upload, approval cards, tickets, account registry, audit log |
 | Gateway | Inside the console process | `src/agents/gateway.py` | Calls the agent (`InvokeAgentRuntime`); falls back to the knowledge base when the agent escalates; rejects actions and lists pending ones |
 | Agent | Bedrock AgentCore Runtime (Python 3.12, code deployment) | `agent_main.py`, `src/agentcore_entrypoint.py` | Routes each prompt to 1–2 tool domains, runs a Strands agent per target account, queues changes, and executes approved ones |
 | Domain router | Inside the agent | `src/agents/router.py` | One Nova Micro call classifies the prompt into domains (compute, storage, network, database, security, ops, deployment) |
@@ -168,8 +168,9 @@ console vouches for `user` from the signed Cognito session.
 | Decision | Why |
 |---|---|
 | AgentCore code deployment (S3 zip, Python 3.12) instead of a container | No image build for the agent; `deploy.py` installs Linux ARM64 wheels locally on any operating system |
-| One Streamlit console with pages instead of two apps | A single service, a single sign-in, and pages chosen by role |
-| Streamlit `st.login` with Cognito | Hosted sign-in, MFA and password reset without custom auth code |
+| React single-page app + FastAPI JSON API in one container | Full control over design and interaction; the API reuses the Python services; one service, one sign-in, pages chosen by role |
+| Server-side OIDC (Authlib) with a signed, HTTP-only session cookie | Cognito-hosted sign-in, MFA and password reset; no tokens in the browser; CSRF blocked by SameSite plus a required custom header |
+| Slow requests (agent turns, approvals) run as background jobs stored in DynamoDB; the browser polls | CloudFront closes requests after 60 s; any console task can answer a poll, so tasks stay stateless |
 | CloudFront in front of a CloudFront-only ALB | HTTPS without owning a domain, WAF, and an origin protected by both prefix list and secret header |
 | Metrics as CloudWatch EMF log lines | No extra API calls on the request path |
 | Approval gate as a Strands hook | Enforced in code for every tool, whatever the prompt says |
