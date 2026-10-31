@@ -90,11 +90,16 @@ Why it is safe:
 
 1. Writes the code (under `src/`, standard library + AWS SDK only) and a CloudFormation template
    that takes `ArtifactBucket`/`ArtifactKey` parameters for the Lambda code location.
-2. Calls `prepare_app_bundle` (read-only for the gate). The bundle is validated: safe paths, size
+2. Writes the app one file per call with `prepare_app_file`, sets the template with
+   `prepare_app_template`, then calls `prepare_app_bundle` (all read-only for the gate). Small,
+   plain-text tool calls avoid the malformed tool calls that large JSON-in-JSON inputs provoke;
+   if one still happens, the agent retries once. The bundle is validated: safe paths, size
    limits, at most 40 resources, no IAM users/access keys/Organizations/SSO/account-level
-   resources, no administrator policies or `Action: "*"`. CloudFormation validates the template in
-   the target account. The bundle is stored as an immutable version under
+   resources, no administrator policies or `Action: "*"`. CloudFormation validates the template
+   in the target account. The bundle is stored as an immutable version under
    `s3://<artifacts>/apps/<tenant>/<app_id>/v<N>/` (manifest, files, template, code.zip).
+   `BUILD_MODEL_ID` (`--build-model`) can give this domain a stronger model than day-to-day
+   operations use.
 3. Calls `deploy_generated_app(app_id, version)`, which the gate queues. The console's approval
    card renders every file and the template from the stored version, so what you review is
    exactly what will be deployed.
@@ -103,7 +108,7 @@ Why it is safe:
    named IAM), and every URL output is called as a smoke test. The result includes the outputs
    and the smoke-test responses.
 
-Changes produce a new version (`get_generated_app` → edit → prepare → deploy). `delete_generated_app`
+Changes produce a new version (`get_generated_app` loads the latest version into the draft → rewrite changed files → `prepare_app_bundle` → deploy). `delete_generated_app`
 (also gated) removes the stack.
 
 ## Cross-account access

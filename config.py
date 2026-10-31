@@ -53,6 +53,9 @@ AGENT_ARN = _env("AGENT_RUNTIME_ARN", "")
 AGENT_ENDPOINT_URL = _env("AGENT_ENDPOINT_URL", "")
 AGENT_MODEL_ID = _env("AGENT_MODEL_ID", "us.amazon.nova-pro-v1:0")
 ROUTER_MODEL_ID = _env("ROUTER_MODEL_ID", "us.amazon.nova-micro-v1:0")
+# Model for the app builder (writing whole applications). Empty = AGENT_MODEL_ID.
+# Code generation benefits from a stronger model, e.g. us.amazon.nova-premier-v1:0.
+BUILD_MODEL_ID = _env("BUILD_MODEL_ID", "")
 AGENT_MAX_TOKENS = _env_int("AGENT_MAX_TOKENS", 8192)
 
 # ── Change approval ───────────────────────────────────────────────────────────

@@ -81,6 +81,13 @@ class TestValidation:
         assert names == ["app.py"]
 
 
+def draft_app(app_id="demo-app", files=FILES, template=TEMPLATE, description="demo"):
+    for path, content in files.items():
+        assert json.loads(abt.prepare_app_file(app_id=app_id, path=path, content=content))["status"] == "success"
+    abt.prepare_app_template(app_id=app_id, template=template)
+    return json.loads(abt.prepare_app_bundle(app_id=app_id, description=description))
+
+
 class TestStoreAndTools:
     def test_versions_are_immutable_and_increment(self, bucket):
         store = AppBundleStore(boto3.client("s3"), bucket)
@@ -93,22 +100,37 @@ class TestStoreAndTools:
             store.load("t2", "demo-app")        # other tenants can't see it
 
     def test_prepare_validates_and_points_to_deploy(self, bucket):
-        out = json.loads(abt.prepare_app_bundle(app_id="demo-app", description="demo",
-                                                files=json.dumps(FILES), template=TEMPLATE))
+        out = draft_app()
         assert out["status"] == "success", out
         assert out["version"] == 1 and "deploy_generated_app" in out["next_step"]
-        bad = json.loads(abt.prepare_app_bundle(app_id="demo-app", description="d",
-                                                files="{not json", template=TEMPLATE))
-        assert bad["error_type"] == "invalid_files"
 
-    def test_get_returns_files_for_iteration(self, bucket):
-        abt.prepare_app_bundle(app_id="demo-app", description="demo", files=json.dumps(FILES), template=TEMPLATE)
-        out = json.loads(abt.get_generated_app(app_id="demo-app"))
-        assert out["files"] == FILES and out["template"] == TEMPLATE
+    def test_empty_draft_and_unsafe_paths_are_refused(self, bucket):
+        assert json.loads(abt.prepare_app_bundle(app_id="nothing-here", description="d"))["error_type"] == "empty_draft"
+        assert json.loads(abt.prepare_app_file(app_id="x-app", path="../etc/x", content="x"))["error_type"] == "invalid_path"
+        assert json.loads(abt.prepare_app_file(app_id="x-app", path="./src/app.py", content="x"))["files"] == ["src/app.py"]
+
+    def test_invalid_bundle_reports_problems(self, bucket):
+        out = draft_app(template=TEMPLATE.replace("AWS::DynamoDB::Table", "AWS::IAM::User"))
+        assert out["error_type"] == "invalid_bundle" and "not allowed" in out["error_message"]
+
+    def test_drafts_are_isolated_per_request(self, bucket):
+        with request_context.bind("t1", "alice", "a"):
+            abt.prepare_app_file(app_id="iso-app", path="src/app.py", content="x")
+        with request_context.bind("t1", "alice", "b"):
+            assert json.loads(abt.prepare_app_bundle(app_id="iso-app", description="d"))["error_type"] == "empty_draft"
+
+    def test_get_loads_draft_so_edits_only_send_changed_files(self, bucket):
+        draft_app()
+        with request_context.bind("t1", "alice", "next-turn"):
+            out = json.loads(abt.get_generated_app(app_id="demo-app"))
+            assert out["files"] == FILES and out["template"] == TEMPLATE
+            abt.prepare_app_file(app_id="demo-app", path="src/app.py", content="# v2\n" + FILES["src/app.py"])
+            v2 = json.loads(abt.prepare_app_bundle(app_id="demo-app", description="v2"))
+        assert v2["version"] == 2 and v2["files"] == sorted(FILES)
 
     def test_deploy_creates_stack_with_code_then_delete(self, bucket, monkeypatch):
         monkeypatch.setattr(abt.time, "sleep", lambda s: None)
-        abt.prepare_app_bundle(app_id="demo-app", description="demo", files=json.dumps(FILES), template=TEMPLATE)
+        draft_app()
         out = json.loads(abt.deploy_generated_app(app_id="demo-app", version=1))
         assert out["status"] == "success", out
         assert out["details"]["action"] == "created" and out["details"]["stack_name"] == "cloudops-app-demo-app"
@@ -138,3 +160,43 @@ def test_gate_and_router_know_the_build_domain():
     assert not is_mutating("prepare_app_bundle") and not is_mutating("get_generated_app")
     assert is_mutating("deploy_generated_app") and is_mutating("delete_generated_app")
     assert "build" in DomainRouter.VALID_DOMAINS
+
+
+def test_agent_builds_app_file_by_file_and_only_deploy_is_queued(bucket, tables):
+    """A real Strands agent (scripted model) drives the whole build flow through the approval gate."""
+    from strands import Agent
+    from tests.test_core.test_approvals import ScriptedModel
+    from src.core.approvals import ActionStore, ApprovalGate
+
+    calls = [("prepare_app_file", {"app_id": "demo-app", "path": p, "content": c}) for p, c in FILES.items()]
+    calls += [("prepare_app_template", {"app_id": "demo-app", "template": TEMPLATE}),
+              ("prepare_app_bundle", {"app_id": "demo-app", "description": "demo"}),
+              ("deploy_generated_app", {"app_id": "demo-app", "version": 1})]
+    gate = ApprovalGate(ActionStore(region="us-east-1"), tenant_id="t1", session_id="s1",
+                        requested_by="alice", account_id=None, region="us-east-1")
+    tools = [abt.prepare_app_file, abt.prepare_app_template, abt.prepare_app_bundle, abt.deploy_generated_app]
+    Agent(model=ScriptedModel(calls), tools=tools, hooks=[gate], callback_handler=None)("build it")
+
+    assert [a["tool_name"] for a in gate.queued] == ["deploy_generated_app"]
+    manifest, files, _ = AppBundleStore(boto3.client("s3"), bucket).load("t1", "demo-app", 1)
+    assert files == FILES
+    assert boto3.client("cloudformation").list_stacks()["StackSummaries"] == []   # nothing deployed yet
+
+
+def test_malformed_tool_call_is_retried_once(monkeypatch):
+    import src.agentcore_entrypoint as ep
+    attempts = []
+
+    class FlakyAgent:
+        def __init__(self, system_prompt, **kw):
+            self.system_prompt = system_prompt
+
+        def __call__(self, prompt):
+            attempts.append(self.system_prompt)
+            if len(attempts) == 1:
+                raise RuntimeError("modelStreamErrorException: Model produced invalid sequence as part of ToolUse")
+            return "<thinking>hmm</thinking>Built it."
+    monkeypatch.setattr(ep, "Agent", FlakyAgent)
+    from unittest.mock import MagicMock
+    text, _, _ = ep._run_agent_with_domains("build a game", ["build"], [], MagicMock())
+    assert text == "Built it." and len(attempts) == 2 and "malformed" in attempts[1]

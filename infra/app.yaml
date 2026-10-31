@@ -48,6 +48,10 @@ Parameters:
   CrossAccountRoleName: {Type: String, Default: CloudOpsCrossAccountRole}
   AgentModelId: {Type: String, Default: us.amazon.nova-pro-v1:0}
   RouterModelId: {Type: String, Default: us.amazon.nova-micro-v1:0}
+  BuildModelId:
+    Type: String
+    Default: ""
+    Description: Model for the app builder; empty uses AgentModelId.
   RequireSeparateApprover:
     Type: String
     Default: "false"
@@ -198,6 +202,7 @@ Resources:
         ARTIFACT_BUCKET: !Ref ArtifactBucketName
         AGENT_MODEL_ID: !Ref AgentModelId
         ROUTER_MODEL_ID: !Ref RouterModelId
+        BUILD_MODEL_ID: !Ref BuildModelId
         CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
         CROSS_ACCOUNT_EXTERNAL_ID: !Ref CrossAccountExternalId
         REQUIRE_SEPARATE_APPROVER: !Ref RequireSeparateApprover
