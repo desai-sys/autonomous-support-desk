@@ -1,0 +1,13 @@
+{
+  "deployment_date": "2026-06-28T14:41:23.437999",
+  "region": "us-east-1",
+  "unique_id": "6d55a7d0",
+  "resources": {
+    "S3_BUCKET_NAME": "cloudops-kb-6d55a7d0",
+    "KB_ROLE_ARN": "arn:aws:iam::741448928336:role/CloudOpsKnowledgeBaseRole-6d55a7d0",
+    "AGENT_ROLE_ARN": "arn:aws:iam::741448928336:role/CloudOpsAgentCoreRole-6d55a7d0",
+    "KNOWLEDGE_BASE_ID": "PLACEHOLDER",
+    "DATA_SOURCE_ID": "PLACEHOLDER",
+    "SECURITY_GROUP_ID": "sg-06d24da880413e8db"
+  }
+}
