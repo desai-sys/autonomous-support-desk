@@ -70,11 +70,20 @@ def _zip_tree(entries) -> bytes:
     return buf.getvalue()
 
 
+AGENT_LOCK = ROOT / "requirements/agent.lock.txt"
+
+
 def build_agent_package() -> bytes:
-    """Agent code + dependencies for AgentCore's managed Python 3.12 runtime (arm64)."""
+    """
+    Agent code + dependencies for AgentCore's managed Python 3.12 runtime (arm64).
+
+    Dependencies come from requirements/agent.lock.txt, which is already resolved
+    for linux/arm64 and installed with --no-deps. Resolving here instead would let
+    pip apply the *host's* environment markers (e.g. pull in pywin32 on Windows).
+    """
     target = BUILD / "agent"
     stamp = target / ".requirements.sha256"
-    req = (ROOT / "requirements/agent.txt").read_bytes()
+    req = AGENT_LOCK.read_bytes()
     req_hash = hashlib.sha256(req).hexdigest()
     if not (stamp.exists() and stamp.read_text() == req_hash):
         log("Installing agent dependencies for linux/arm64 (Python 3.12)...")
@@ -84,7 +93,8 @@ def build_agent_package() -> bytes:
             sys.executable, "-m", "pip", "install", "--quiet", "--no-compile",
             "--platform", "manylinux2014_aarch64", "--implementation", "cp",
             "--python-version", "3.12", "--only-binary=:all:",
-            "--target", str(target), "-r", str(ROOT / "requirements/agent.txt"),
+            "--no-deps", "--require-hashes",
+            "--target", str(target), "-r", str(AGENT_LOCK),
         ], check=True)
         stamp.write_text(req_hash)
     deps = [(p, p.relative_to(target).as_posix()) for p in target.rglob("*")
@@ -253,6 +263,10 @@ def preflight(session, region: str) -> str:
 
 
 def main() -> None:
+    # Windows consoles may not be UTF-8; never crash on a status symbol.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     p.add_argument("--profile", help="AWS CLI profile to use")

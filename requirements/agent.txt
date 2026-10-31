@@ -1,5 +1,8 @@
 # Agent runtime (Bedrock AgentCore, Python 3.12, linux/arm64).
-# scripts/deploy.py installs these as manylinux aarch64 wheels into the agent package.
+# scripts/deploy.py installs requirements/agent.lock.txt (these pins plus all transitive
+# dependencies, resolved for linux/arm64 with hashes). After changing this file, regenerate it:
+#   uv pip compile requirements/agent.txt --python-platform aarch64-manylinux2014 \
+#     --python-version 3.12 --generate-hashes --no-header --annotation-style line -o requirements/agent.lock.txt
 bedrock-agentcore==1.25.2
 strands-agents==1.63.0
 boto3==1.43.123
