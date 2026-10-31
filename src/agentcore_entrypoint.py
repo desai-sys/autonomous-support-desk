@@ -174,6 +174,9 @@ from src.tools.deployment_tools import (
     create_deployment_plan,
 )
 
+from src.tools.provisioning_tools import launch_ec2_instance
+from src.tools.aws_api_tools import call_aws_api, query_aws_api
+
 from src.tools.artifact_tools import (
     inspect_uploaded_artifact,
     deploy_artifact_to_lambda,
@@ -190,6 +193,13 @@ from src.tools.artifact_tools import (
 
 COMMON_RULES = (
     "RULES:\n"
+    "- You CAN act on AWS: never tell the operator to do it themselves in the console. If a "
+    "purpose-built tool fits, use it; otherwise use query_aws_api (read-only operations) or "
+    "call_aws_api (any change) with the exact boto3 service, operation and parameters.\n"
+    "- If a change needs details the operator hasn't given, ask for them in ONE short message "
+    "and propose sensible defaults (e.g. instance type t3.micro, Amazon Linux 2023, default VPC), "
+    "so they can just reply 'yes' or adjust. Look up what you can yourself (VPCs, subnets, key "
+    "pairs, existing resources) instead of asking.\n"
     "- Investigate with read-only tools first and base every statement on tool output. "
     "If you search for a resource and cannot find it, say so; never substitute a different "
     "resource or invent identifiers.\n"
@@ -207,7 +217,8 @@ DOMAIN_INTROS = {
     "compute": (
         "You are an AWS Compute specialist. You manage EC2, Lambda, ECS, EKS, Batch, SageMaker, "
         "App Runner, Lightsail, and CloudWatch metrics/alarms/logs. Use list_ec2_instances to "
-        "find instances first and analyze before proposing changes."
+        "find instances first and analyze before proposing changes. To create instances use "
+        "launch_ec2_instance (defaults: t3.micro, Amazon Linux 2023, default VPC, SSM-managed)."
     ),
     "storage": (
         "You are an AWS Storage specialist. You manage S3 buckets, EBS volumes, EFS, ECR, Backup, "
@@ -250,6 +261,9 @@ DOMAIN_INTROS = {
 }
 
 DOMAIN_PROMPTS = {d: f"{intro}\n\n{COMMON_RULES}" for d, intro in DOMAIN_INTROS.items()}
+
+# Nova models sometimes emit their private reasoning; never show it to operators.
+_THINKING_RE = re.compile(r"<thinking>.*?(</thinking>|$)\s*", re.DOTALL | re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +415,15 @@ TOOLS_DEPLOYMENT = [
     search_resource_by_name,
     describe_agent_capabilities,
 ]
+
+
+# Every domain can fall back to the generic AWS API tools; EC2 launches are
+# useful wherever compute or deployments come up.
+TOOLS_COMPUTE.append(launch_ec2_instance)
+TOOLS_DEPLOYMENT.append(launch_ec2_instance)
+for _group in (TOOLS_COMPUTE, TOOLS_STORAGE, TOOLS_NETWORK, TOOLS_DATABASE,
+               TOOLS_SECURITY, TOOLS_COST_OPS, TOOLS_DEPLOYMENT):
+    _group.extend([query_aws_api, call_aws_api])
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +743,8 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
 
     agent = Agent(model=_AGENT_MODEL, system_prompt=system_prompt, tools=tools,
                   hooks=[gate], callback_handler=None)
-    return str(agent(prompt)), domains, len(tools)
+    text = _THINKING_RE.sub("", str(agent(prompt))).strip()
+    return text, domains, len(tools)
 
 
 # ---------------------------------------------------------------------------

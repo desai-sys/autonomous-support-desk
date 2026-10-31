@@ -1,7 +1,7 @@
 # CloudOps Command Center
 
 Chat with an AI agent that inspects and operates your AWS accounts. It can
-investigate across 278 AWS tools, deploy code you upload as a zip (Lambda, EC2,
+investigate across 281 AWS tools, deploy code you upload as a zip (Lambda, EC2,
 ECS Fargate, S3 websites), and work across many accounts. **Every change it
 proposes waits for a person to approve the exact call before anything runs.**
 
@@ -69,7 +69,7 @@ src/
   core/monitoring.py       JSON logging and CloudWatch EMF metrics
   services/                Tickets, knowledge-base retrieval, code-upload staging
   jobs/learning_loop.py    Hourly knowledge-base sync
-  tools/                   278 AWS tools in seven domains (+ uploaded-zip deployment)
+  tools/                   281 AWS tools in seven domains (+ uploaded-zip deployment)
 ui/                        Streamlit console (Cognito sign-in, pages by role)
 infra/                     CloudFormation: foundation.yaml, app.yaml, cross_account_role.yaml
 scripts/                   deploy.py, destroy.py

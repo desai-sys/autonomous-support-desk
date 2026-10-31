@@ -34,7 +34,7 @@ logger = structlog.get_logger()
 # Tool names starting with these prefixes only read state.
 READ_ONLY_PREFIXES = (
     "list_", "analyze_", "get_", "describe_", "check_", "inspect_",
-    "search_", "detect_", "validate_", "lookup_", "prepare_",
+    "search_", "detect_", "validate_", "lookup_", "prepare_", "query_",
 )
 # Read-only tools whose names don't follow the prefix convention.
 READ_ONLY_TOOLS = frozenset({"create_deployment_plan"})
