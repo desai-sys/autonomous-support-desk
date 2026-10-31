@@ -1,7 +1,7 @@
 # Product Overview
 
 CloudOps Command Center: operators chat with an AI agent that inspects and operates their AWS
-accounts. It investigates with 278 AWS tools, deploys uploaded code (Lambda, EC2, ECS Fargate,
+accounts. It investigates with 281 AWS tools, deploys uploaded code (Lambda, EC2, ECS Fargate,
 S3 websites), works across many accounts, and escalates what it can't handle to human SREs whose
 resolutions train a knowledge base.
 

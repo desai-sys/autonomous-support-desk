@@ -13,7 +13,7 @@ it with `python docs/architecture.py`, which needs Graphviz.
 | Gateway | Inside the console process | `src/agents/gateway.py` | Calls the agent (`InvokeAgentRuntime`); falls back to the knowledge base when the agent escalates; rejects actions and lists pending ones |
 | Agent | Bedrock AgentCore Runtime (Python 3.12, code deployment) | `agent_main.py`, `src/agentcore_entrypoint.py` | Routes each prompt to 1–2 tool domains, runs a Strands agent per target account, queues changes, and executes approved ones |
 | Domain router | Inside the agent | `src/agents/router.py` | One Nova Micro call classifies the prompt into domains (compute, storage, network, database, security, ops, deployment) |
-| Tools | Inside the agent | `src/tools/` | 278 boto3 tools; their clients are account-aware through `src/core/aws_clients.py` |
+| Tools | Inside the agent | `src/tools/` | 281 boto3 tools; their clients are account-aware through `src/core/aws_clients.py`. Every domain also has `query_aws_api` (any read-only AWS operation, secret-returning calls blocked) and `call_aws_api` (any other AWS operation, always approval-gated), so the agent is never stuck for lack of a purpose-built tool |
 | Approval engine | Inside the agent | `src/core/approvals.py` | Intercepts mutating tool calls, stores them, and executes approved ones exactly once |
 | Account registry | DynamoDB `accounts` | `src/core/accounts.py` | Allow-list of accounts the agent may assume roles in |
 | Learning loop | Scheduled ECS task (hourly) | `src/jobs/learning_loop.py` | Writes resolved tickets, with tenant metadata, to the knowledge bucket and starts ingestion |
@@ -24,7 +24,7 @@ it with `python docs/architecture.py`, which needs Graphviz.
 The agent follows a **router → specialist → gated tools** pattern.
 
 1. **Route.** Nova Micro picks 1–2 of seven domains, so the model sees about
-   30–60 tool schemas instead of 278. An attached code upload always adds
+   30–60 tool schemas instead of 281. An attached code upload always adds
    `deployment`. If the reply shows a needed tool was missing, the agent retries
    once with one extra domain.
 2. **Reason.** A Strands `Agent` (Nova Pro) runs with the merged tools, a

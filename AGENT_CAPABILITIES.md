@@ -7,6 +7,15 @@ something (start, stop, modify, create, delete, deploy, rollback, ...) are inves
 queued as **changes awaiting approval**: each shows the exact tool call, account and region, and
 runs only when an operator, SRE or admin clicks **Approve**. Viewers get read-only answers.
 
+If details are missing (for example the instance type for a new EC2 instance), the agent asks
+once and proposes defaults. Anything without a dedicated tool is still possible: the agent uses
+`query_aws_api` for read-only AWS operations and `call_aws_api` for any change (approval-gated).
+
+| Action | Sample Query |
+|--------|-------------|
+| Launch EC2 instances | "create an EC2 instance" · "launch 2 t3.small Ubuntu 24.04 servers named api in subnet-0abc" |
+| Anything else | "create a VPC 10.20.0.0/16 with a tag env=dev" · "list my Route 53 health checks" |
+
 ---
 
 ## Compute (~62 tools)

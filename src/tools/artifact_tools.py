@@ -502,6 +502,28 @@ def deploy_artifact_to_lambda(
 # ============================================================================
 
 
+def _ensure_ec2_ssm_profile() -> bool:
+    """Create the CloudOpsEC2SSMRole instance profile in the active account if missing.
+
+    Returns True when something was created (EC2 needs a few seconds before it
+    accepts a new profile)."""
+    iam = boto3.client("iam")
+    created = _ensure_role(
+        EC2_SSM_ROLE_NAME, "ec2.amazonaws.com",
+        ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
+        "Lets CloudOps manage EC2 instances through SSM",
+    )
+    try:
+        iam.get_instance_profile(InstanceProfileName=EC2_SSM_ROLE_NAME)
+    except iam.exceptions.NoSuchEntityException:
+        iam.create_instance_profile(InstanceProfileName=EC2_SSM_ROLE_NAME)
+        iam.add_role_to_instance_profile(
+            InstanceProfileName=EC2_SSM_ROLE_NAME, RoleName=EC2_SSM_ROLE_NAME
+        )
+        created = True
+    return created
+
+
 def _ami_parameter(instance_type: str) -> str:
     family = instance_type.split(".", 1)[0]
     arch = "arm64" if re.match(r"^[a-z]+\d+g", family) else "x86_64"
@@ -536,21 +558,7 @@ def launch_ec2_for_artifact(
     try:
         name = name or _generate_default_name()
         ec2 = boto3.client("ec2", region_name=region)
-        iam = boto3.client("iam")
-
-        role_created = _ensure_role(
-            EC2_SSM_ROLE_NAME, "ec2.amazonaws.com",
-            ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"],
-            "Lets CloudOps manage EC2 instances through SSM",
-        )
-        try:
-            iam.get_instance_profile(InstanceProfileName=EC2_SSM_ROLE_NAME)
-        except iam.exceptions.NoSuchEntityException:
-            iam.create_instance_profile(InstanceProfileName=EC2_SSM_ROLE_NAME)
-            iam.add_role_to_instance_profile(
-                InstanceProfileName=EC2_SSM_ROLE_NAME, RoleName=EC2_SSM_ROLE_NAME
-            )
-            role_created = True
+        role_created = _ensure_ec2_ssm_profile()
 
         ami_id = boto3.client("ssm", region_name=region).get_parameter(
             Name=_ami_parameter(instance_type)
