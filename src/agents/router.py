@@ -28,7 +28,7 @@ Domains:
   database   - RDS, DynamoDB, ElastiCache, DocumentDB, Redshift, Neptune, OpenSearch, Glue, Athena
   security   - IAM, GuardDuty, WAF, KMS, Secrets Manager, CloudTrail, Inspector, Macie, Config, MFA
   ops        - costs, billing, budgets, CodePipeline, SSM, Step Functions, CloudWatch
-  deployment - deploy, ship, push, release, launch code, rollback, update function, deploy container, static site, CloudFormation stack deploy, SAM deploy, code deployment, CI/CD
+  deployment - deploy, ship, push, release, launch code, run uploaded code/zip, rollback, update function, deploy container, static site, CloudFormation stack deploy, SAM deploy, code deployment, CI/CD
 
 Rules:
 - Return 1 word if the query clearly belongs to one domain.
@@ -47,9 +47,11 @@ Rules:
     "ship code to S3 bucket"       -> deployment storage
     "deploy CloudFormation stack"  -> deployment ops
     "rollback my Lambda"           -> deployment compute
+    "run this zip on EC2"          -> deployment compute
+    "deploy the uploaded code"     -> deployment
 - For costs/billing/spending, always include: ops
 - For IAM/permissions/credentials, always include: security
-- For deploy/ship/push/release/launch code/rollback, always include: deployment
+- For deploy/ship/push/release/launch code/run uploaded code/rollback, always include: deployment
 - For general/ambiguous queries ("hello", "what can you do"), return: ops
 - Use conversation history to resolve follow-ups.
 - Respond with ONLY 1 or 2 domain words. No punctuation, no explanation."""

@@ -2,6 +2,7 @@
 Autonomous CloudOps Command Center — Streamlit Frontend.
 """
 
+import re
 import time
 import uuid
 import streamlit as st
@@ -11,7 +12,9 @@ from typing import Optional
 from src.agents.orchestrator import AgentGateway
 from src.models.query import Query
 from src.services.dynamo_service import DynamoDBService
+from src.services.artifact_service import ArtifactService, ArtifactValidationError
 from src.core.security import security_manager, User, UserRole, Permission
+import config
 
 st.set_page_config(
     page_title="CloudOps Command Center",
@@ -654,6 +657,50 @@ def get_gateway():
 def get_dynamo():
     return DynamoDBService()
 
+@st.cache_resource
+def get_artifacts():
+    return ArtifactService()
+
+
+# ── Targeting & upload helpers ────────────────────────────────────────────────
+
+ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+# Bare 12-digit ids typed in chat; ids inside ARNs (":123456789012:") are ignored.
+BARE_ACCOUNT_ID_RE = re.compile(r"(?<![:\d])(\d{12})(?![\d:])")
+REGIONS = [
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1",
+    "eu-west-1", "eu-west-2", "eu-central-1", "eu-north-1",
+    "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "sa-east-1",
+]
+
+DEPLOY_TARGETS = {
+    "auto": "Let the agent recommend",
+    "lambda": "AWS Lambda",
+    "ec2": "Amazon EC2 — existing instance",
+    "ec2_new": "Amazon EC2 — launch a new instance",
+    "ecs": "Amazon ECS Fargate (zip has a Dockerfile)",
+    "s3_static_site": "S3 static website (zip has index.html)",
+}
+
+
+def account_label(account_id: str) -> str:
+    name = getattr(config, "MANAGED_ACCOUNTS", {}).get(account_id)
+    return f"{name} ({account_id})" if name else account_id
+
+
+def build_deploy_prompt(filename: str, target: str, options: dict) -> str:
+    """Turn the upload form into the chat message that asks the agent to deploy."""
+    details = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in options.items())
+    if target == "auto":
+        text = f"I uploaded `{filename}`. Inspect it and recommend where to deploy and run it."
+    elif target == "ec2_new":
+        text = f"Launch a new EC2 instance and deploy and run the uploaded `{filename}` on it."
+    else:
+        text = f"Deploy and run the uploaded `{filename}` on {DEPLOY_TARGETS[target]}."
+    if details:
+        text += f" ({details})"
+    return text + " Show me the plan first."
+
 
 # ── Sign-in page ──────────────────────────────────────────────────────────────
 
@@ -760,8 +807,53 @@ with st.sidebar:
         "🤖 Live agent — can inspect and (with confirmation) change AWS resources."
     )
 
-    st.divider()
-    st.markdown('<div class="section-label">Navigation</div>', unsafe_allow_html=True)
+    if not kb_mode:
+        st.markdown('<div class="section-label">🌐 Target Accounts</div>', unsafe_allow_html=True)
+        managed = list(getattr(config, "MANAGED_ACCOUNTS", {}).keys())
+        st.session_state.setdefault("custom_accounts", [])
+        st.session_state.setdefault("target_accounts", [])
+        # Selection changes requested elsewhere are applied before the widget renders.
+        if "pending_targets" in st.session_state:
+            st.session_state.target_accounts = st.session_state.pop("pending_targets")
+        account_options = list(dict.fromkeys(
+            managed + st.session_state.custom_accounts + st.session_state.target_accounts
+        ))
+        st.multiselect(
+            "Target accounts",
+            account_options,
+            key="target_accounts",
+            format_func=account_label,
+            placeholder="This account (agent runtime)",
+            label_visibility="collapsed",
+            help=(
+                "Leave empty to act on the agent's own account. Pick one or more accounts "
+                f"to act there via the {config.CROSS_ACCOUNT_ROLE_NAME} role; several "
+                "accounts run the same request in each and return one combined report. "
+                "Bare 12-digit account IDs typed in chat are added here automatically."
+            ),
+        )
+        with st.form("add_account_form", clear_on_submit=True, border=False):
+            c_in, c_btn = st.columns([3, 1])
+            new_account = c_in.text_input(
+                "Add account ID", placeholder="123456789012", label_visibility="collapsed"
+            )
+            if c_btn.form_submit_button("Add"):
+                new_account = new_account.strip().replace("-", "")
+                if ACCOUNT_ID_RE.match(new_account):
+                    if new_account not in st.session_state.custom_accounts:
+                        st.session_state.custom_accounts.append(new_account)
+                    if new_account not in st.session_state.target_accounts:
+                        st.session_state.pending_targets = st.session_state.target_accounts + [new_account]
+                    st.rerun()
+                else:
+                    st.error("Account IDs are 12 digits.")
+        st.selectbox(
+            "Default region",
+            REGIONS,
+            index=REGIONS.index(config.AWS_REGION) if config.AWS_REGION in REGIONS else 0,
+            key="target_region",
+        )
+
     st.divider()
 
     # Quick actions — SRE / Admin only
@@ -795,6 +887,9 @@ with st.sidebar:
 # ── Status Bar ────────────────────────────────────────────────────────────────
 
 current_time = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+active_region = st.session_state.get("target_region", config.AWS_REGION)
+_targets = st.session_state.get("target_accounts", [])
+active_accounts = ", ".join(account_label(a) for a in _targets) if _targets else "this account"
 st.markdown(f"""
 <div class="status-bar">
     <div class="status-item">
@@ -805,7 +900,10 @@ st.markdown(f"""
         <span>Agent: Nova Pro v2.0</span>
     </div>
     <div class="status-item">
-        <span>Region: us-east-1</span>
+        <span>Region: {active_region}</span>
+    </div>
+    <div class="status-item">
+        <span>Accounts: {active_accounts}</span>
     </div>
     <div class="status-item">
         <span>{current_time}</span>
@@ -827,7 +925,7 @@ st.markdown("""
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Tools Available", "275+")
 c2.metric("Agent", "Nova Pro")
-c3.metric("Region", "us-east-1")
+c3.metric("Region", active_region)
 c4.metric("Role", user.role.value.title())
 
 st.divider()
@@ -840,6 +938,82 @@ dynamo = get_dynamo()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# ── Code upload ("📦 Deploy code" drop-down) ──────────────────────────────────
+
+kb_mode = st.session_state.get("chat_mode", "🤖 Agent Actions").endswith("Knowledge Base")
+can_execute = security_manager.check_permission(user, Permission.EXECUTE_TOOLS)
+
+if not kb_mode and can_execute:
+    tb_upload, tb_status = st.columns([1, 3])
+    with tb_upload.popover("📦 Deploy code (.zip)", use_container_width=True):
+        st.markdown("**Upload code and choose where to run it**")
+        upload = st.file_uploader(
+            "Code archive", type=["zip"], key="artifact_upload",
+            help=f"Up to {config.MAX_ARTIFACT_MB} MB. Deployed into the target account(s) "
+                 "and region selected in the sidebar.",
+        )
+        target = st.selectbox(
+            "Run it on", list(DEPLOY_TARGETS), format_func=DEPLOY_TARGETS.get, key="artifact_target"
+        )
+        options = {}
+        if target == "lambda":
+            options["function_name"] = st.text_input("Function name", placeholder="auto-generated if empty")
+            options["runtime"] = st.selectbox(
+                "Runtime", ["auto-detect", "python3.12", "python3.11", "nodejs20.x", "nodejs18.x"]
+            )
+            options["handler"] = st.text_input("Handler", placeholder="auto-detect, e.g. app.lambda_handler")
+        elif target == "ec2":
+            options["instance_id"] = st.text_input("Instance ID", placeholder="i-0abc123def4567890")
+        elif target == "ec2_new":
+            options["instance_type"] = st.selectbox("Instance type", ["t3.micro", "t3.small", "t3.medium", "t4g.small"])
+        elif target == "ecs":
+            options["service_name"] = st.text_input("Service name", placeholder="auto-generated if empty")
+        elif target == "s3_static_site":
+            options["bucket_name"] = st.text_input("Bucket name", placeholder="auto-generated if empty")
+        if target in ("ec2", "ec2_new"):
+            options["run_command"] = st.text_input(
+                "Run command (optional)", placeholder="pip3 install -r requirements.txt && python3 app.py"
+            )
+        options = {k: v.strip() for k, v in options.items() if v and v.strip() and v != "auto-detect"}
+
+        if st.button("Upload & send to agent", type="primary", use_container_width=True,
+                     disabled=upload is None):
+            if target == "ec2" and "instance_id" not in options:
+                st.error("Enter the instance ID, or choose “launch a new instance”.")
+            else:
+                try:
+                    with st.spinner("Uploading..."):
+                        ref = get_artifacts().upload(
+                            upload.getvalue(), upload.name, user.tenant_id, user.user_id
+                        )
+                    ref["target"] = target
+                    ref["options"] = options
+                    st.session_state.artifact = ref
+                    st.session_state.quick_action = build_deploy_prompt(upload.name, target, options)
+                    security_manager.log_audit_event(
+                        user_id=user.user_id, tenant_id=user.tenant_id,
+                        action="artifact_uploaded", resource=ref["uri"], result="SUCCESS",
+                        details={"size_bytes": ref["size_bytes"], "sha256": ref["sha256"],
+                                 "target": target},
+                    )
+                    st.rerun()
+                except ArtifactValidationError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+
+    artifact = st.session_state.get("artifact")
+    if artifact:
+        with tb_status:
+            c_info, c_clear = st.columns([5, 1])
+            c_info.info(
+                f"📎 **{artifact['filename']}** · {artifact['size_bytes'] / 1024:.0f} KB · "
+                f"{artifact['file_count']} files · target: {DEPLOY_TARGETS[artifact['target']]}"
+            )
+            if c_clear.button("✖", help="Detach this upload from the conversation"):
+                del st.session_state["artifact"]
+                st.rerun()
 
 # Inject quick-action as a user message
 if "quick_action" in st.session_state and st.session_state.quick_action:
@@ -867,9 +1041,6 @@ for msg in st.session_state.messages:
             with st.expander("🔍 Technical Details"):
                 st.json(msg["metadata"])
 
-# Resolve the active chat mode (set by the sidebar radio)
-kb_mode = st.session_state.get("chat_mode", "🤖 Agent Actions").endswith("Knowledge Base")
-
 # Chat input — placeholder reflects the active mode
 if kb_mode:
     _placeholder = "Search past resolutions — e.g. 'how do we fix RDS connection timeouts?'"
@@ -887,6 +1058,19 @@ if user_input:
     if not security_manager.check_permission(user, Permission.VIEW_TICKETS):
         st.error("Your role does not have access to this feature.")
         st.stop()
+    if not kb_mode and not can_execute:
+        st.error("Your role can't run agent actions. Switch to Knowledge Base mode.")
+        st.stop()
+
+    # Account ids typed in the message become sticky targets, so a later
+    # "yes, go ahead" still runs in the account the plan was made for.
+    if not kb_mode:
+        typed = [a for a in BARE_ACCOUNT_ID_RE.findall(user_input)
+                 if a not in st.session_state.get("target_accounts", [])]
+        if typed:
+            st.session_state.custom_accounts = list(dict.fromkeys(
+                st.session_state.get("custom_accounts", []) + typed))
+            st.session_state.pending_targets = st.session_state.get("target_accounts", []) + typed
 
     with st.chat_message("user"):
         st.markdown(user_input)
@@ -922,7 +1106,17 @@ if user_input:
             result = orchestrator.query_knowledge_base(query, user=user)
         else:
             # Agent Actions mode — full agent + RAG fallback chain
-            result = orchestrator.send(query, history=history or None, user=user)
+            target_accounts = st.session_state.get(
+                "pending_targets", st.session_state.get("target_accounts", [])
+            )
+            result = orchestrator.send(
+                query,
+                history=history or None,
+                user=user,
+                accounts=target_accounts,
+                region=st.session_state.get("target_region", config.AWS_REGION),
+                artifact=st.session_state.get("artifact"),
+            )
         elapsed_ms = (time.time() - start_time) * 1000
 
         tag = ("KB" if kb_mode else result.resolution_type.upper())
@@ -977,6 +1171,10 @@ if user_input:
                 **(result.metadata or {}),
             },
         })
+
+        # Refresh the sidebar when chat text added new target accounts.
+        if "pending_targets" in st.session_state:
+            st.rerun()
 
     except Exception as e:
         st.error(f"Error: {str(e)}")

@@ -160,6 +160,17 @@ def get_client(service_name: str, **kwargs):
     return _boto3.client(service_name, **kwargs)
 
 
+def get_base_client(service_name: str, **kwargs):
+    """
+    Client that always uses the runtime's own (base) account credentials,
+    regardless of the active target account. Used for platform-owned resources
+    such as the uploaded-artifact bucket, which lives in the base account even
+    when a deployment targets another account.
+    """
+    kwargs = _resolve_region(dict(kwargs))
+    return _boto3.client(service_name, **kwargs)
+
+
 def get_resource(service_name: str, **kwargs):
     """Drop-in replacement for ``boto3.resource`` that is account-aware."""
     kwargs = _resolve_region(dict(kwargs))
