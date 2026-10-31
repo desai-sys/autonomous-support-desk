@@ -342,6 +342,24 @@ once and proposes defaults. Anything without a dedicated tool is still possible:
 
 ---
 
+## Build an Application
+
+Describe what you want; the agent writes the code and infrastructure, you review every file on
+the approval card, and one approval deploys and smoke-tests it.
+
+| Action | Sample Query |
+|--------|-------------|
+| New app | "build me a URL shortener API with a DynamoDB table" |
+| New app | "create a webhook receiver that stores JSON payloads in S3 and lists them at GET /items" |
+| Scheduled job | "build a Lambda that checks https://example.com every 5 minutes and alerts my SNS topic if it's down" |
+| Change it | "add a DELETE endpoint to url-shortener" |
+| Remove it | "delete the url-shortener app" |
+
+Generated code uses only the standard library and the AWS SDK, and resources are serverless by
+default (Lambda, API Gateway/function URLs, DynamoDB, S3, SQS, EventBridge).
+
+---
+
 ## Targeting a Specific Account
 
 By default every request acts on the platform account (where the agent runs). In the

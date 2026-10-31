@@ -117,3 +117,26 @@ def test_separate_approver(console, monkeypatch):
     _queue_action(at, requested_by="alice")
     at.run()
     assert [b for b in at.button if b.label == "✅ Approve"][0].disabled
+
+
+def test_generated_app_card_shows_code_for_review(console, monkeypatch):
+    import boto3
+    import config
+    from src.services.app_bundles import AppBundleStore
+    monkeypatch.setattr(config, "ARTIFACT_BUCKET", "cloudops-artifacts-test")
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="cloudops-artifacts-test")
+    template = ("Parameters: {ArtifactBucket: {Type: String}, ArtifactKey: {Type: String}}\n"
+                "Resources: {T: {Type: AWS::SNS::Topic}}\n")
+    AppBundleStore(boto3.client("s3"), "cloudops-artifacts-test").save(
+        "t1", "hello-app", "Says hello", {"src/app.py": "print('hi')", "README.md": "# Hello"}, template, "alice")
+
+    at = console(UserRole.OPERATOR)
+    from src.core.approvals import ActionStore
+    ActionStore().create(tenant_id="t1", session_id=at.session_state["conversation_id"], requested_by="alice",
+                         account_id="", region="us-east-1", tool_name="deploy_generated_app",
+                         tool_input={"app_id": "hello-app", "version": 1})
+    at.run()
+    assert not at.exception, at.exception
+    labels = [e.label for e in at.expander]
+    assert "CloudFormation template" in labels and "📄 src/app.py" in labels and "📄 README.md" in labels
+    assert any("print('hi')" in c.value for c in at.code)

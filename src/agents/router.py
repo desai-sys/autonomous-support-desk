@@ -19,7 +19,7 @@ class DomainRouter:
     Tool groups from both domains are merged and deduplicated in the entrypoint.
     """
 
-    VALID_DOMAINS = {"compute", "storage", "network", "database", "security", "ops", "deployment"}
+    VALID_DOMAINS = {"compute", "storage", "network", "database", "security", "ops", "deployment", "build"}
 
     CLASSIFIER_PROMPT = """You are an AWS query router. Given a user message, classify it into 1 or 2 domains.
 
@@ -30,6 +30,7 @@ Domains:
   database   - RDS, DynamoDB, ElastiCache, DocumentDB, Redshift, Neptune, OpenSearch, Glue, Athena
   security   - IAM, GuardDuty, WAF, KMS, Secrets Manager, CloudTrail, Inspector, Macie, Config, MFA
   ops        - costs, billing, budgets, CodePipeline, SSM, Step Functions, CloudWatch
+  build      - build/create/generate/write a NEW application, API, website, bot or service from a description (the agent writes the code and infrastructure), or change an app it generated earlier
   deployment - deploy, ship, push, release, launch code, run uploaded code/zip, rollback, update function, deploy container, static site, CloudFormation stack deploy, SAM deploy, code deployment, CI/CD
 
 Rules:
@@ -51,6 +52,9 @@ Rules:
     "rollback my Lambda"           -> deployment compute
     "run this zip on EC2"          -> deployment compute
     "deploy the uploaded code"     -> deployment
+    "build me a URL shortener API" -> build
+    "create a todo app with a database" -> build
+    "add a delete endpoint to my app" -> build
 - For costs/billing/spending, always include: ops
 - For IAM/permissions/credentials, always include: security
 - For deploy/ship/push/release/launch code/run uploaded code/rollback, always include: deployment
