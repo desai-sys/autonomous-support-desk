@@ -617,6 +617,15 @@ Resources:
       # Users must not be able to change their own tenant.
       WriteAttributes: [email, name]
 
+  # Managed login (the user pool domain uses version 2) shows "Login pages
+  # unavailable" for any app client without a branding style.
+  OidcClientLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      ClientId: !Ref OidcClient
+      UseCognitoProvidedValues: true
+
   OidcClientSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
