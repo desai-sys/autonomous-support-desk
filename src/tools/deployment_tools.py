@@ -1523,6 +1523,26 @@ def deploy_static_site(
                 "suggestion": "Provide at least one file, e.g. '{\"index.html\": \"<html></html>\"}'"
             })
 
+        return _deploy_static_site_impl(files_map, bucket_name, enable_cloudfront, region)
+
+    except Exception as e:
+        logger.error("deploy_static_site_error", error=str(e))
+        return json.dumps({
+            "status": "failed",
+            "error_type": "unexpected_error",
+            "error_message": f"Unexpected error during static site deployment: {str(e)}",
+            "suggestion": "Check the input parameters and AWS connectivity, then try again."
+        })
+
+
+def _deploy_static_site_impl(
+    files_map: dict,
+    bucket_name: str = '',
+    enable_cloudfront: bool = False,
+    region: str = 'us-east-1',
+) -> str:
+    """Deploy a {filename: str | bytes} map as an S3 static site (see deploy_static_site)."""
+    try:
         # 2. Generate bucket name if not provided
         if not bucket_name or not bucket_name.strip():
             timestamp = str(int(time.time()))
@@ -1559,6 +1579,10 @@ def deploy_static_site(
                         'ErrorDocument': {'Key': 'error.html'},
                     }
                 )
+
+                # New buckets block public policies by default; lift that for this
+                # bucket only so the public-read website policy below can apply.
+                s3_client.delete_public_access_block(Bucket=bucket_name)
 
                 # Set bucket policy to allow public read (required for static hosting)
                 bucket_policy = {
@@ -2476,11 +2500,41 @@ def deploy_ecs_service(
     Returns:
         JSON string with deployment manifest on success, or error details on failure.
     """
+    return _deploy_ecs_service_impl(dockerfile_content, app_code, service_name, cluster_name, region)
+
+
+def _deploy_ecs_service_impl(
+    dockerfile_content: str,
+    app_code: str,
+    service_name: str = '',
+    cluster_name: str = 'cloudops-cluster',
+    region: str = 'us-east-1',
+    source_zip: Optional[bytes] = None,
+) -> str:
+    """Build a Docker image via CodeBuild, push to ECR, and deploy to ECS Fargate.
+
+    When ``source_zip`` is given it is used as the complete build context (it must
+    contain a Dockerfile at its root) and ``dockerfile_content``/``app_code`` are ignored.
+
+    Creates an ECR repository if it does not exist, uploads the Dockerfile and application
+    code to an S3 staging bucket, triggers AWS CodeBuild to build the image and push to ECR,
+    then creates or updates an ECS Fargate service with the new image.
+
+    Args:
+        dockerfile_content: The Dockerfile content for building the container image.
+        app_code: The application source code to include in the container build.
+        service_name: ECS service and ECR repository name. If empty, a default name is generated.
+        cluster_name: ECS cluster name. Defaults to 'cloudops-cluster'.
+        region: AWS region for deployment.
+
+    Returns:
+        JSON string with deployment manifest on success, or error details on failure.
+    """
     try:
         logger.info("deploy_ecs_service", service_name=service_name, cluster_name=cluster_name, region=region)
 
-        # Validate inputs
-        if not dockerfile_content or not dockerfile_content.strip():
+        # Validate inputs (a source zip carries its own Dockerfile and code)
+        if source_zip is None and (not dockerfile_content or not dockerfile_content.strip()):
             return json.dumps({
                 "status": "failed",
                 "error_type": "invalid_payload",
@@ -2488,7 +2542,7 @@ def deploy_ecs_service(
                 "suggestion": "Provide valid Dockerfile content for the container build."
             })
 
-        if not app_code or not app_code.strip():
+        if source_zip is None and (not app_code or not app_code.strip()):
             return json.dumps({
                 "status": "failed",
                 "error_type": "invalid_payload",
@@ -2554,11 +2608,14 @@ def deploy_ecs_service(
         s3_prefix = f"deployments/ecs/{service_name}/{timestamp}"
 
         # Create a zip archive containing Dockerfile and app code
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr('Dockerfile', dockerfile_content)
-            zf.writestr('app.py', app_code)
-        zip_bytes = zip_buffer.getvalue()
+        if source_zip is not None:
+            zip_bytes = source_zip
+        else:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('Dockerfile', dockerfile_content)
+                zf.writestr('app.py', app_code)
+            zip_bytes = zip_buffer.getvalue()
 
         s3_key = f"{s3_prefix}/source.zip"
         try:

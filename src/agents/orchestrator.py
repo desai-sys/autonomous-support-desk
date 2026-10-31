@@ -40,10 +40,16 @@ class AgentGateway:
         self.agent_arn = getattr(config, "AGENT_ARN", "")
 
     def send(self, query: Query, history: List[str] = None,
-             user: User = None) -> Resolution:
+             user: User = None, accounts: Optional[List[str]] = None,
+             region: Optional[str] = None, artifact: Optional[dict] = None) -> Resolution:
         """
         Send query to AgentCore. Falls back to RAG on escalation,
         then to human escalation if RAG also fails.
+
+        accounts: target account ids chosen in the UI. None lets the agent infer
+            them from the message; an empty list pins the base account.
+        region: default region for tool calls.
+        artifact: reference to an uploaded code zip (see ArtifactService.upload).
         """
         start_time = time.time()
 
@@ -79,10 +85,11 @@ class AgentGateway:
             pass
 
         try:
-            result = self._invoke_agent(query, history)
+            result = self._invoke_agent(query, history, accounts, region, artifact)
 
-            # If agent escalates, try RAG as fallback
-            if result.escalate:
+            # If agent escalates, try RAG as fallback (not for deployments of an
+            # uploaded zip: a past resolution is no substitute for doing it)
+            if result.escalate and not artifact:
                 rag = self.rag_service.resolve(query)
                 if not rag.escalate:
                     return rag
@@ -109,7 +116,9 @@ class AgentGateway:
                 escalate=True,
             )
 
-    def _invoke_agent(self, query: Query, history: List[str] = None) -> Resolution:
+    def _invoke_agent(self, query: Query, history: List[str] = None,
+                      accounts: Optional[List[str]] = None, region: Optional[str] = None,
+                      artifact: Optional[dict] = None) -> Resolution:
         """
         Send query to AgentCore with domain="auto".
         The agent container handles routing internally via DomainRouter.
@@ -133,7 +142,14 @@ class AgentGateway:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "context": query.context or {},
                 "history": history or [],
+                "user_message": query.text,
             }
+            if accounts is not None:
+                payload["account_ids"] = list(accounts)
+            if region:
+                payload["region"] = region
+            if artifact:
+                payload["artifact"] = artifact
 
             session_id = pad_session_id(query.customer_id)
 
@@ -173,6 +189,7 @@ class AgentGateway:
                 escalate=False,
                 metadata={
                     "domain": result.get("domain", "unknown"),
+                    "accounts": result.get("accounts", []),
                     "execution_time_ms": result.get("execution_time_ms", 0),
                     "tools_available": result.get("tools_available", 0),
                 },

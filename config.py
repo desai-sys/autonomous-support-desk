@@ -40,6 +40,20 @@ DEFAULT_USER_ID = "demo-user"
 # DEPLOYMENT_AND_FEATURES.md "Multi-account" for the exact trust policy.
 CROSS_ACCOUNT_ROLE_NAME = "CloudOpsCrossAccountRole"
 
+# Accounts offered in the Command Center "Target account(s)" picker, as
+# {account_id: friendly name}. Any other 12-digit id can still be typed in the UI.
+# Each listed account needs CROSS_ACCOUNT_ROLE_NAME deployed
+# (deployment/cross_account_role.yaml).
+MANAGED_ACCOUNTS = {}
+
+# Code Upload Configuration
+# Zip files uploaded from the Command Center are staged here (in the base
+# account) and read by the agent's deploy tools. The UI host and the AgentCore
+# runtime role both need access; see deployment/deploy_agentcore.md.
+ARTIFACT_BUCKET = f"cloudops-artifacts-{UNIQUE_ID}"
+ARTIFACT_PREFIX = "uploads/"
+MAX_ARTIFACT_MB = 200
+
 # Agent Configuration (update after deployment)
 AGENT_ARN = "arn:aws:bedrock-agentcore:us-east-1:058264401886:runtime/src_agentcore_entrypoint-hlvOBNH0hy"
 

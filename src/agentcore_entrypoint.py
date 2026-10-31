@@ -170,6 +170,14 @@ from src.tools.deployment_tools import (
     create_deployment_plan,
 )
 
+from src.tools.artifact_tools import (
+    inspect_uploaded_artifact,
+    deploy_artifact_to_lambda,
+    deploy_artifact_to_ec2, launch_ec2_for_artifact,
+    deploy_artifact_to_ecs,
+    deploy_artifact_to_static_site,
+)
+
 # Import enterprise core modules
 from src.core.monitoring import monitoring_manager, monitor_performance
 from src.core.security import security_manager
@@ -294,6 +302,15 @@ DOMAIN_PROMPTS = {
         "4. WAIT for operator confirmation before executing any deployment.\n"
         "5. Execute the appropriate deploy_* tool.\n"
         "6. Return the deployment manifest with resource identifiers.\n\n"
+        "UPLOADED ZIP WORKFLOW (when an UPLOADED ARTIFACT note is present):\n"
+        "1. Call inspect_uploaded_artifact first.\n"
+        "2. Pick the target the operator asked for (lambda, ec2, ecs, s3 static site); "
+        "if they did not say, recommend one from recommended_targets and ask.\n"
+        "3. Present a plan via create_deployment_plan with account, region, resource name, "
+        "runtime/handler or run command, and any IAM roles or instances that will be created.\n"
+        "4. After confirmation call deploy_artifact_to_lambda, deploy_artifact_to_ec2 "
+        "(launch_ec2_for_artifact first if they have no instance), deploy_artifact_to_ecs, "
+        "or deploy_artifact_to_static_site with the artifact_uri.\n\n"
         "RULES:\n"
         "- NEVER deploy without presenting a plan and receiving confirmation.\n"
         "- Always include the AWS account ID and region in the deployment plan.\n"
@@ -446,6 +463,12 @@ TOOLS_DEPLOYMENT = [
     validate_cfn_template, deploy_cfn_stack, rollback_cfn_stack,
     prepare_code_payload, detect_code_language,
     create_deployment_plan,
+    inspect_uploaded_artifact,
+    deploy_artifact_to_lambda,
+    deploy_artifact_to_ec2, launch_ec2_for_artifact, get_ssm_command_output,
+    deploy_artifact_to_ecs,
+    deploy_artifact_to_static_site,
+    list_ec2_instances, list_lambda_functions,
     search_resource_by_name,
     describe_agent_capabilities,
 ]
@@ -503,6 +526,8 @@ def invoke(payload: dict) -> dict:
     session_id = payload.get("session_id", "default")
     tenant_id = payload.get("tenant_id", "default")
     history = payload.get("history", [])
+    region = payload.get("region") or None
+    context_notes = _build_context_notes(payload.get("artifact"), region)
 
     # Non-fatal telemetry
     try:
@@ -531,7 +556,7 @@ def invoke(payload: dict) -> dict:
             account_id = target_accounts[0] if target_accounts else None
             with use_account(account_id):
                 result_text, final_domains, tool_count = _resolve_query(
-                    prompt, domain, history
+                    prompt, domain, history, context_notes, bool(payload.get("artifact"))
                 )
 
             duration_ms = (time.time() - start_time) * 1000
@@ -568,7 +593,9 @@ def invoke(payload: dict) -> dict:
         for account_id in target_accounts:
             try:
                 with use_account(account_id):
-                    a_text, a_domains, a_tools = _resolve_query(prompt, domain, history)
+                    a_text, a_domains, a_tools = _resolve_query(
+                        prompt, domain, history, context_notes, bool(payload.get("artifact"))
+                    )
                 domains_seen.update(a_domains)
                 max_tools = max(max_tools, a_tools)
                 per_account.append({
@@ -644,13 +671,19 @@ def _extract_target_accounts(payload: dict, prompt: str) -> list:
 
     Precedence:
       1. Explicit payload fields: "accounts" / "account_ids" (list) or
-         "account_id" / "account" (single).
-      2. 12-digit account numbers mentioned anywhere in the prompt text.
+         "account_id" / "account" (single). If any of these keys is present the
+         caller has chosen explicitly, and an empty value means the base account.
+      2. 12-digit account numbers mentioned in the latest user message
+         ("user_message", falling back to the prompt). Conversation history is
+         not scanned, so ARNs echoed in earlier replies never trigger a fan-out.
       3. Empty list -> act on the runtime's own (base) account.
 
     Returns a de-duplicated, order-preserving list of 12-digit account id strings.
     """
     raw = []
+    explicit = any(
+        key in payload for key in ("accounts", "account_ids", "account_id", "account")
+    )
 
     for key in ("accounts", "account_ids"):
         val = payload.get(key)
@@ -664,9 +697,10 @@ def _extract_target_accounts(payload: dict, prompt: str) -> list:
         if isinstance(val, str) and val.strip():
             raw.append(val.strip())
 
-    # Fall back to account numbers named in the prompt itself.
-    if not raw and prompt:
-        raw.extend(_ACCOUNT_ID_RE.findall(prompt))
+    # Fall back to account numbers named in the latest message itself.
+    if not explicit:
+        message = payload.get("user_message") or prompt or ""
+        raw.extend(_ACCOUNT_ID_RE.findall(message))
 
     # Keep only valid 12-digit ids, de-duplicated, order preserved.
     seen = set()
@@ -678,7 +712,36 @@ def _extract_target_accounts(payload: dict, prompt: str) -> list:
     return accounts
 
 
-def _resolve_query(prompt: str, domain: str, history: list):
+def _build_context_notes(artifact, region) -> list:
+    """System-prompt notes describing the operator's upload and chosen region."""
+    notes = []
+    if region:
+        notes.append(
+            f"REGION CONTEXT: The operator selected region {region}. Pass region='{region}' "
+            f"to every tool that takes a region unless the operator names another one."
+        )
+    if isinstance(artifact, dict) and artifact.get("uri"):
+        lines = [
+            "UPLOADED ARTIFACT: The operator uploaded a code zip for deployment.",
+            f"- artifact_uri: {artifact['uri']}",
+            f"- filename: {artifact.get('filename', 'unknown')}",
+            f"- size_bytes: {artifact.get('size_bytes', 'unknown')}",
+            f"- sha256: {artifact.get('sha256', 'unknown')}",
+        ]
+        if artifact.get("target"):
+            lines.append(f"- requested target: {artifact['target']}")
+        if artifact.get("options"):
+            lines.append(f"- operator options: {json.dumps(artifact['options'])}")
+        lines.append(
+            "Use inspect_uploaded_artifact, then present a deployment plan and wait for "
+            "confirmation before calling any deploy_artifact_* tool. Never invent a different URI."
+        )
+        notes.append("\n".join(lines))
+    return notes
+
+
+def _resolve_query(prompt: str, domain: str, history: list,
+                   context_notes: list = None, has_artifact: bool = False):
     """
     Route the prompt to 1-2 domains, run the agent, and auto-retry with an
     expanded domain set if the agent signals it lacked the right tool.
@@ -694,8 +757,12 @@ def _resolve_query(prompt: str, domain: str, history: list):
     else:
         domains = [domain]
 
+    # An attached upload always needs the deployment tools loaded.
+    if has_artifact and "deployment" not in domains:
+        domains = domains[:1] + ["deployment"]
+
     result_text, final_domains, tool_count = _run_agent_with_domains(
-        prompt, domains, history
+        prompt, domains, history, context_notes
     )
 
     # Auto-retry if agent indicates missing tools
@@ -722,13 +789,14 @@ def _resolve_query(prompt: str, domain: str, history: list):
             if new_domains_to_add:
                 expanded = final_domains + new_domains_to_add[:1]  # max 3 total
                 result_text, final_domains, tool_count = _run_agent_with_domains(
-                    prompt, expanded, history
+                    prompt, expanded, history, context_notes
                 )
 
     return result_text, final_domains, tool_count
 
 
-def _run_agent_with_domains(prompt: str, domains: list, history: list = None):
+def _run_agent_with_domains(prompt: str, domains: list, history: list = None,
+                            context_notes: list = None):
     """
     Create and run an agent with merged tools from the specified domains.
     Returns (response_text, domains_used, tool_count).
@@ -762,6 +830,9 @@ def _run_agent_with_domains(prompt: str, domains: list, history: list = None):
             f"{active_account} (via an assumed cross-account role). State this account id "
             f"when you report results, and do not claim to act on any other account."
         )
+
+    for note in context_notes or []:
+        system_prompt += f"\n\n{note}"
 
     # Add universal safety rules
     system_prompt += (

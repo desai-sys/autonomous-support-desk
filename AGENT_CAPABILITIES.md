@@ -330,17 +330,36 @@ Use these queries in the Command Center (default: http://localhost:8501, or your
 
 ## Targeting a Specific Account
 
-By default every query acts on the account the agent runs in. To have the agent
-act on a different account, mention its 12-digit account ID in the prompt (or
-pass `account_id` / `accounts` in the invoke payload). The agent assumes the
-`CloudOpsCrossAccountRole` in that account and states which account it acted on
-in its report. Mention several account IDs to fan out across all of them.
+By default every query acts on the account the agent runs in. In the Command
+Center, choose the account(s) in the sidebar's **Target Accounts** picker (or
+type a 12-digit account ID in the message; it is added to the picker so follow-up
+confirmations stay on that account). API callers pass `account_id` / `account_ids`
+in the invoke payload. The agent assumes the `CloudOpsCrossAccountRole` in that
+account and states which account it acted on in its report. Pick several accounts
+to fan out across all of them.
 
 | Action | Sample Query |
 |--------|-------------|
 | Act on another account | "list EC2 instances in account 123456789012" |
 | Act on multiple accounts | "check for public S3 buckets in accounts 111122223333 and 444455556666" |
 | Fan-out audit | "list IAM users without MFA across accounts 111122223333, 444455556666" |
+
+---
+
+## Deploying an Uploaded Zip
+
+Use **📦 Deploy code (.zip)** above the chat to upload a zip and pick a target; the
+agent inspects it, shows a plan, and deploys after you confirm.
+
+| Action | Sample Query (after uploading) |
+|--------|-------------|
+| Get a recommendation | "inspect the uploaded zip and tell me where it should run" |
+| Lambda | "deploy the uploaded zip to Lambda as orders-api" |
+| Existing EC2 | "deploy it to i-0abc123def4567890 and run `python3 app.py` in the background" |
+| New EC2 | "launch a t3.small and run the uploaded code with `npm install && npm start`" |
+| ECS Fargate | "build the Dockerfile in the upload and run it on ECS as web-frontend" |
+| Static site | "publish the uploaded zip as a static website" |
+| Another account | pick the account in **Target Accounts**, then "deploy the upload to Lambda" |
 
 ---
 

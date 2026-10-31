@@ -156,6 +156,7 @@ The original 26 named tools (`analyze_ec2_sg`, `fix_ec2_sg`, `check_s3_public_ac
 | `database_tools.py` | RDS, DynamoDB, ElastiCache, DocumentDB |
 | `security_tools.py` | IAM, Secrets Manager, KMS, WAF, GuardDuty |
 | `deployment_tools.py` | Lambda deploy/rollback, ECS/ECR deploy/rollback, EC2 deploy (SSM), App Runner (container + source), S3 static sites, CloudFormation/SAM validate/deploy/rollback, code payload handling, language detection |
+| `artifact_tools.py` | Uploaded zip inspection and deployment to Lambda, EC2 (existing or newly launched, via SSM), ECS Fargate, and S3 static websites |
 | `aws_tools.py` | All remaining AWS services (150+ tools) + `describe_agent_capabilities` self-description tool + `search_resource_by_name` cross-service resource search |
 
 ---
@@ -220,10 +221,12 @@ The original 26 named tools (`analyze_ec2_sg`, `fix_ec2_sg`, `check_s3_public_ac
 │   │   ├── ticket.py               # Ticket and TicketUpdate models
 │   │   └── metrics.py              # Dashboard metrics model
 │   ├── services/
+│   │   ├── artifact_service.py     # Stages uploaded code zips in S3
 │   │   ├── dynamo_service.py       # DynamoDB CRUD for CloudOpsTickets
 │   │   └── rag_service.py          # Bedrock Knowledge Base retrieval
 │   └── tools/
 │       ├── deployment_tools.py     # Code deployment tools (Lambda, ECS, EC2, App Runner, S3, CFN)
+│       ├── artifact_tools.py       # Deploy uploaded zips (Lambda, EC2, ECS Fargate, S3 website)
 │       ├── compute_tools.py        # EC2, Lambda, Auto Scaling, ECS tools
 │       ├── storage_tools.py        # S3, EBS, EFS tools
 │       ├── network_tools.py        # VPC, Security Groups, Route53, CloudFront tools
@@ -279,6 +282,8 @@ All deployment-specific values are centralized in `config.py`. Update this file 
 | `S3_BUCKET_NAME` | `config.py` | S3 bucket for resolution documents |
 | `AWS_REGION` | `config.py` | AWS region for all service clients |
 | `TICKETS_TABLE` | `config.py` | DynamoDB table name (`CloudOpsTickets`) |
+| `MANAGED_ACCOUNTS` | `config.py` | `{account_id: name}` shown in the Command Center's Target Accounts picker |
+| `ARTIFACT_BUCKET`, `MAX_ARTIFACT_MB` | `config.py` | Private bucket for uploaded code zips (created on first upload) and the upload size limit |
 | `CROSS_ACCOUNT_ROLE_NAME` | `config.py` | Name of the IAM role the agent assumes in each managed target account (default `CloudOpsCrossAccountRole`). The role must exist in every target account, trust the AgentCore runtime role, and grant the permissions the tools need. |
 
 ### Invoke Response Shape
@@ -300,4 +305,16 @@ When a request targets one or more explicit accounts (see below), the response a
 
 ### Targeting Accounts
 
-By default a request acts on the runtime's own (base) account. To target other accounts, callers can pass explicit fields in the invoke payload — `accounts`/`account_ids` (list) or `account_id`/`account` (single) — or simply mention one or more 12-digit account numbers anywhere in the prompt text. Each target account is handled under its own assumed `CROSS_ACCOUNT_ROLE_NAME` credentials; multiple accounts fan out and are aggregated into a single report.
+By default a request acts on the runtime's own (base) account. In the Command Center, pick one or more accounts in the sidebar's **Target Accounts** picker (accounts listed in `config.MANAGED_ACCOUNTS` appear by name; any 12-digit ID can be added, and bare IDs typed in chat are added automatically). The picker is sent as `account_ids` on every turn, so a "yes, go ahead" confirmation runs in the same account the plan was made for. Other callers can pass `accounts`/`account_ids` (list) or `account_id`/`account` (single) in the invoke payload; when none of those keys is present, 12-digit IDs in the latest user message (`user_message`) are used. Conversation history is never scanned, so ARNs from earlier replies cannot trigger a fan-out. Each target account is handled under its own assumed `CROSS_ACCOUNT_ROLE_NAME` credentials; multiple accounts fan out and are aggregated into a single report. Deploy `deployment/cross_account_role.yaml` in each target account (see `deployment/deploy_agentcore.md`).
+
+The sidebar's **Default region** is sent as `region`; the agent passes it to every tool unless the operator names another region.
+
+### Uploading Code to Deploy
+
+The **📦 Deploy code (.zip)** drop-down above the chat uploads a zip, lets the operator choose where to run it (Lambda, an existing or new EC2 instance, ECS Fargate, an S3 static website, or "let the agent recommend") with optional details such as function name, instance ID or run command, and sends the request to the agent. The upload is staged privately in `config.ARTIFACT_BUCKET` (`src/services/artifact_service.py`) and stays attached to the conversation until detached, so the confirmation turn still has it. The agent inspects the zip (`inspect_uploaded_artifact`), presents a deployment plan, and after confirmation deploys it with the tools in `src/tools/artifact_tools.py` into the selected account(s) and region. The invoke payload carries the upload as:
+
+```json
+"artifact": {"uri": "s3://cloudops-artifacts-<id>/uploads/<tenant>/<uuid>/app.zip",
+             "filename": "app.zip", "size_bytes": 12345, "sha256": "...",
+             "target": "lambda", "options": {"function_name": "my-fn"}}
+```
