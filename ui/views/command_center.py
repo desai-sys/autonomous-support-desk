@@ -13,7 +13,7 @@ import streamlit as st
 import config
 from src.core.security import Permission, User
 from src.services.artifact_service import ArtifactValidationError
-from ui.common import account_label, artifacts, gateway, managed_accounts, tickets
+from ui.common import account_label, app_bundles, artifacts, gateway, managed_accounts, tickets
 
 REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1",
@@ -31,6 +31,9 @@ DEPLOY_TARGETS = {
 # Bare 12-digit ids typed in chat; ids inside ARNs (":123456789012:") are ignored.
 BARE_ACCOUNT_ID_RE = re.compile(r"(?<![:\d])(\d{12})(?![\d:])")
 _PREFIX_RE = re.compile(r"^\[.*?\]\s*\(\d+ms\)\s*\n+")
+_LANGUAGES = {".py": "python", ".js": "javascript", ".mjs": "javascript", ".ts": "typescript",
+              ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".md": "markdown", ".html": "html",
+              ".css": "css", ".sh": "bash", ".sql": "sql", ".txt": "text"}
 
 
 def _new_conversation() -> None:
@@ -143,6 +146,26 @@ def _upload_toolbar(user: User) -> None:
             st.rerun()
 
 
+def _app_preview(user: User, action: dict) -> None:
+    """Show a generated app's code and template so it can be reviewed before approval."""
+    args = action["tool_input"]
+    try:
+        manifest, files, template = app_bundles().load(user.tenant_id, args.get("app_id", ""),
+                                                       int(args.get("version") or 0))
+    except Exception as e:
+        st.warning(f"Could not load the generated app for review: {e}")
+        return
+    st.markdown(f"**App `{manifest['app_id']}` · version {manifest['version']}** — {manifest['description']}")
+    for warning in manifest.get("warnings", []):
+        st.caption(f"⚠️ {warning}")
+    with st.expander("CloudFormation template", expanded=False):
+        st.code(template, language="yaml")
+    for path in sorted(files):
+        ext = path[path.rfind("."):].lower() if "." in path else ""
+        with st.expander(f"📄 {path}"):
+            st.code(files[path], language=_LANGUAGES.get(ext, "text"))
+
+
 def _action_cards(user: User) -> None:
     pending = gateway().pending_actions(user, st.session_state.conversation_id)
     if not pending:
@@ -154,6 +177,8 @@ def _action_cards(user: User) -> None:
             st.markdown(f"**`{action['tool_name']}`** · {account_label(action['account_id'])}"
                         f" · {action['region'] or config.AWS_REGION}")
             st.code(json.dumps(action["tool_input"], indent=2), language="json")
+            if action["tool_name"] == "deploy_generated_app":
+                _app_preview(user, action)
             expires = datetime.fromtimestamp(action["expires_at"], tz=timezone.utc)
             st.caption(f"Requested by {action['requested_by']} · expires {expires:%H:%M} UTC · "
                        f"id {action['action_id']}")

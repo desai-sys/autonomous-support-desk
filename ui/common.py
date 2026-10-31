@@ -4,6 +4,7 @@ import streamlit as st
 
 from src.agents.gateway import AgentGateway
 from src.core.accounts import AccountRegistry
+from src.services.app_bundles import AppBundleStore
 from src.services.artifact_service import ArtifactService
 from src.services.ticket_service import TicketService
 
@@ -21,6 +22,13 @@ def tickets() -> TicketService:
 @st.cache_resource
 def artifacts() -> ArtifactService:
     return ArtifactService()
+
+
+@st.cache_resource
+def app_bundles() -> AppBundleStore:
+    import boto3
+    import config
+    return AppBundleStore(boto3.client("s3", region_name=config.AWS_REGION))
 
 
 @st.cache_resource

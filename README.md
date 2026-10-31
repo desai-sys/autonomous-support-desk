@@ -1,7 +1,7 @@
 # CloudOps Command Center
 
 Chat with an AI agent that inspects and operates your AWS accounts. It can
-investigate across 281 AWS tools, deploy code you upload as a zip (Lambda, EC2,
+investigate across 285 AWS tools, deploy code you upload as a zip (Lambda, EC2,
 ECS Fargate, S3 websites), and work across many accounts. **Every change it
 proposes waits for a person to approve the exact call before anything runs.**
 
@@ -22,6 +22,10 @@ proposes waits for a person to approve the exact call before anything runs.**
 - **Deploy uploaded code.** Upload a zip and choose Lambda, an existing or new
   EC2 instance, ECS Fargate, or an S3 static site. The agent inspects it, plans,
   and queues the deployment for approval.
+- **Builds whole applications.** Describe an app ("a URL shortener API with a database") and
+  the agent writes the code and the CloudFormation for it. You review every file on the approval
+  card; one approval deploys it to the chosen account and smoke-tests the live URL. Ask for
+  changes and it ships a new version.
 - **Learns from people.** Requests the agent can't handle become tickets.
   Resolutions feed a tenant-filtered Bedrock knowledge base every hour.
 - **Production foundations.** Cognito sign-in with role groups and MFA;
@@ -69,7 +73,7 @@ src/
   core/monitoring.py       JSON logging and CloudWatch EMF metrics
   services/                Tickets, knowledge-base retrieval, code-upload staging
   jobs/learning_loop.py    Hourly knowledge-base sync
-  tools/                   281 AWS tools in seven domains (+ uploaded-zip deployment)
+  tools/                   285 AWS tools in seven domains (+ uploaded-zip deployment)
 ui/                        Streamlit console (Cognito sign-in, pages by role)
 infra/                     CloudFormation: foundation.yaml, app.yaml, cross_account_role.yaml
 scripts/                   deploy.py, destroy.py

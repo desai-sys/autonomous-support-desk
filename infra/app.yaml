@@ -113,6 +113,16 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/agent/*"
                   - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/uploads/*"
+              - Sid: GeneratedAppDrafts
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/apps/*"
+              - Sid: ListGeneratedAppVersions
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}"
+                Condition:
+                  StringLike: {"s3:prefix": ["apps/*"]}
               - Sid: AssumeManagedAccountRoles
                 Effect: Allow
                 Action: sts:AssumeRole
@@ -422,6 +432,10 @@ Resources:
                 Effect: Allow
                 Action: [s3:PutObject, s3:GetObject]
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/uploads/*"
+              - Sid: ReviewGeneratedApps
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/apps/*"
               - Sid: UploadBucket
                 Effect: Allow
                 Action: s3:ListBucket

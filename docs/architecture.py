@@ -45,7 +45,7 @@ with Diagram("CloudOps Command Center — AWS architecture", filename=str(OUT), 
         scheduler = EventbridgeScheduler("Scheduler")
 
         with Cluster("Bedrock AgentCore Runtime"):
-            agent = Bedrock("CloudOps agent\nStrands · 281 tools\nApproval gate")
+            agent = Bedrock("CloudOps agent\nStrands · 285 tools\nApproval gate · app builder")
         with Cluster("Amazon Bedrock"):
             router = Bedrock("Nova Micro\ndomain router")
             llm = Bedrock("Nova Pro\nreasoning")

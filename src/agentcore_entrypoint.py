@@ -28,6 +28,7 @@ from src.agents.router import DomainRouter
 from src.core.accounts import AccountRegistry
 from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating
 from src.core.aws_clients import base_account_id, boto3, get_active_account, use_account
+from src.core import request_context
 from src.core.monitoring import configure_logging, metrics
 from src.core.security import Permission, ROLE_PERMISSIONS, UserRole, security_manager
 from src.core.usage import usage_meter
@@ -175,6 +176,9 @@ from src.tools.deployment_tools import (
 )
 
 from src.tools.provisioning_tools import launch_ec2_instance
+from src.tools.app_builder_tools import (
+    delete_generated_app, deploy_generated_app, get_generated_app, prepare_app_bundle,
+)
 from src.tools.aws_api_tools import call_aws_api, query_aws_api
 
 from src.tools.artifact_tools import (
@@ -257,6 +261,32 @@ DOMAIN_INTROS = {
         "operator wants EC2 but has no instance, queue launch_ec2_for_artifact first and tell "
         "them to approve it, then ask them to request the deployment once the instance is "
         "Online in SSM (check_ec2_ssm_status)."
+    ),
+    "build": (
+        "You are an AWS application builder. From the operator's description you write a complete, "
+        "working application (code + CloudFormation) and deploy it after their approval.\n"
+        "WORKFLOW:\n"
+        "1. If essential requirements are unclear (what it does, public or private, data to store), ask "
+        "ONE short question with proposed defaults; otherwise just build it.\n"
+        "2. Write the app and call prepare_app_bundle. Fix any validation errors it returns and call it "
+        "again.\n"
+        "3. Call deploy_generated_app with the returned app_id and version. It is queued: tell the operator "
+        "what will be created, the estimated cost profile, and that they can review every file on the "
+        "approval card.\n"
+        "4. To change an existing app, call get_generated_app, edit, prepare a new version, deploy it.\n"
+        "CONVENTIONS:\n"
+        "- Prefer serverless: Lambda (python3.12 or nodejs20.x), API Gateway HTTP API or a Lambda function "
+        "URL, DynamoDB (PAY_PER_REQUEST), S3, SQS, EventBridge schedules.\n"
+        "- Code goes under src/ and may only use the standard library and the AWS SDK (boto3 / "
+        "@aws-sdk v3) because no dependencies are installed. src/app.py -> Handler: app.handler.\n"
+        "- The template must declare `ArtifactBucket` and `ArtifactKey` String parameters and use "
+        "`Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey}` (or SAM `CodeUri: {Bucket: "
+        "!Ref ArtifactBucket, Key: !Ref ArtifactKey}`).\n"
+        "- Give the function its own execution role with only the permissions it needs (no '*' "
+        "actions, no admin policies, no IAM users). Pass table/bucket names via environment variables.\n"
+        "- Output every URL (e.g. ApiUrl) so it is smoke-tested after deployment; make GET / return "
+        "a useful response.\n"
+        "- Include a README.md explaining endpoints and usage. Keep apps small and readable."
     ),
 }
 
@@ -426,6 +456,13 @@ for _group in (TOOLS_COMPUTE, TOOLS_STORAGE, TOOLS_NETWORK, TOOLS_DATABASE,
     _group.extend([query_aws_api, call_aws_api])
 
 
+TOOLS_BUILD = [
+    prepare_app_bundle, get_generated_app, deploy_generated_app, delete_generated_app,
+    validate_cfn_template, query_aws_api, call_aws_api,
+    search_resource_by_name, describe_agent_capabilities,
+]
+
+
 # ---------------------------------------------------------------------------
 # Domain tool map
 # ---------------------------------------------------------------------------
@@ -438,6 +475,7 @@ DOMAIN_TOOLS = {
     "security": TOOLS_SECURITY,
     "ops": TOOLS_COST_OPS,
     "deployment": TOOLS_DEPLOYMENT,
+    "build": TOOLS_BUILD,
 }
 
 # Every tool by name, for executing approved actions.
@@ -484,14 +522,9 @@ def invoke(payload: dict) -> dict:
     start = time.time()
     mode = payload.get("mode", "chat")
     try:
-        if mode == "execute":
-            result = _execute(payload, caller)
-        elif mode == "check_account":
-            result = _check_account(payload, caller)
-        elif mode == "chat":
-            result = _chat(payload, caller)
-        else:
-            result = {"response": f"Unknown mode '{mode}'.", "error": "BadRequest"}
+        with request_context.bind(caller["tenant_id"], caller["user_id"],
+                                  payload.get("session_id", "")):
+            result = _dispatch(mode, payload, caller)
         ok = "error" not in result
     except Exception as e:
         logger.exception("invoke_failed")
@@ -501,6 +534,16 @@ def invoke(payload: dict) -> dict:
     result["execution_time_ms"] = round(duration_ms, 2)
     result["session_id"] = payload.get("session_id", "")
     return result
+
+
+def _dispatch(mode: str, payload: dict, caller: dict) -> dict:
+    if mode == "execute":
+        return _execute(payload, caller)
+    if mode == "check_account":
+        return _check_account(payload, caller)
+    if mode == "chat":
+        return _chat(payload, caller)
+    return {"response": f"Unknown mode '{mode}'.", "error": "BadRequest"}
 
 
 def _caller(payload: dict) -> dict:

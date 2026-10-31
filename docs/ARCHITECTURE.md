@@ -13,7 +13,7 @@ it with `python docs/architecture.py`, which needs Graphviz.
 | Gateway | Inside the console process | `src/agents/gateway.py` | Calls the agent (`InvokeAgentRuntime`); falls back to the knowledge base when the agent escalates; rejects actions and lists pending ones |
 | Agent | Bedrock AgentCore Runtime (Python 3.12, code deployment) | `agent_main.py`, `src/agentcore_entrypoint.py` | Routes each prompt to 1–2 tool domains, runs a Strands agent per target account, queues changes, and executes approved ones |
 | Domain router | Inside the agent | `src/agents/router.py` | One Nova Micro call classifies the prompt into domains (compute, storage, network, database, security, ops, deployment) |
-| Tools | Inside the agent | `src/tools/` | 281 boto3 tools; their clients are account-aware through `src/core/aws_clients.py`. Every domain also has `query_aws_api` (any read-only AWS operation, secret-returning calls blocked) and `call_aws_api` (any other AWS operation, always approval-gated), so the agent is never stuck for lack of a purpose-built tool |
+| Tools | Inside the agent | `src/tools/` | 285 boto3 tools; their clients are account-aware through `src/core/aws_clients.py`. Every domain also has `query_aws_api` (any read-only AWS operation, secret-returning calls blocked) and `call_aws_api` (any other AWS operation, always approval-gated), so the agent is never stuck for lack of a purpose-built tool |
 | Approval engine | Inside the agent | `src/core/approvals.py` | Intercepts mutating tool calls, stores them, and executes approved ones exactly once |
 | Account registry | DynamoDB `accounts` | `src/core/accounts.py` | Allow-list of accounts the agent may assume roles in |
 | Learning loop | Scheduled ECS task (hourly) | `src/jobs/learning_loop.py` | Writes resolved tickets, with tenant metadata, to the knowledge bucket and starts ingestion |
@@ -24,7 +24,7 @@ it with `python docs/architecture.py`, which needs Graphviz.
 The agent follows a **router → specialist → gated tools** pattern.
 
 1. **Route.** Nova Micro picks 1–2 of seven domains, so the model sees about
-   30–60 tool schemas instead of 281. An attached code upload always adds
+   30–60 tool schemas instead of 285. An attached code upload always adds
    `deployment`. If the reply shows a needed tool was missing, the agent retries
    once with one extra domain.
 2. **Reason.** A Strands `Agent` (Nova Pro) runs with the merged tools, a
@@ -83,6 +83,28 @@ Why it is safe:
 - **Fails closed.** If the queue write fails, the tool still does not run.
 - **Prompt injection can't bypass it.** Instructions hidden in tool output can
   at most get a change *queued*, never executed.
+
+## App builder
+
+"Build me a URL shortener" is routed to the `build` domain. The agent:
+
+1. Writes the code (under `src/`, standard library + AWS SDK only) and a CloudFormation template
+   that takes `ArtifactBucket`/`ArtifactKey` parameters for the Lambda code location.
+2. Calls `prepare_app_bundle` (read-only for the gate). The bundle is validated: safe paths, size
+   limits, at most 40 resources, no IAM users/access keys/Organizations/SSO/account-level
+   resources, no administrator policies or `Action: "*"`. CloudFormation validates the template in
+   the target account. The bundle is stored as an immutable version under
+   `s3://<artifacts>/apps/<tenant>/<app_id>/v<N>/` (manifest, files, template, code.zip).
+3. Calls `deploy_generated_app(app_id, version)`, which the gate queues. The console's approval
+   card renders every file and the template from the stored version, so what you review is
+   exactly what will be deployed.
+4. On approval, the code zip is copied to the target account's staging bucket, the stack
+   `cloudops-app-<app_id>` is created or updated (`CAPABILITY_IAM`, `CAPABILITY_AUTO_EXPAND`; never
+   named IAM), and every URL output is called as a smoke test. The result includes the outputs
+   and the smoke-test responses.
+
+Changes produce a new version (`get_generated_app` → edit → prepare → deploy). `delete_generated_app`
+(also gated) removes the stack.
 
 ## Cross-account access
 

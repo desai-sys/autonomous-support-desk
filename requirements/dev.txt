@@ -5,4 +5,3 @@ pytest==9.2.0
 moto==5.2.5
 cfn-lint==1.59.0
 diagrams==0.25.1
-PyYAML==6.0.3
