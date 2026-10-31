@@ -132,6 +132,7 @@ Useful options (run `python scripts/deploy.py --help` for all of them):
 | `--daily-request-limit N` | `0` (unlimited) | Agent requests per tenant per day. |
 | `--console-tasks N` | `2` | Minimum number of console tasks. Auto scaling goes up to 6. |
 | `--domain`, `--certificate-arn` | none | Serve the console on your own domain (see Step 8). |
+| `--build-model` | same as `--agent-model` | Model for the app builder (writing whole applications). A stronger model such as `us.amazon.nova-premier-v1:0` produces better code. |
 | `--app-name` | `cloudops` | Deploy several independent copies side by side. |
 | `--environment` | `prod` | Label used in metrics and the UI. |
 

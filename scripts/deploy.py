@@ -283,6 +283,8 @@ def main() -> None:
     p.add_argument("--console-tasks", type=int, default=2)
     p.add_argument("--agent-model", default="us.amazon.nova-pro-v1:0")
     p.add_argument("--router-model", default="us.amazon.nova-micro-v1:0")
+    p.add_argument("--build-model", default="",
+                   help="Model for the app builder (e.g. us.amazon.nova-premier-v1:0); default: --agent-model")
     p.add_argument("--domain", default="", help="Custom console domain (needs --certificate-arn)")
     p.add_argument("--certificate-arn", default="", help="ACM certificate in us-east-1 for --domain")
     args = p.parse_args()
@@ -318,6 +320,7 @@ def main() -> None:
         "PlatformAccountAccess": args.platform_access,
         "AgentModelId": args.agent_model,
         "RouterModelId": args.router_model,
+        "BuildModelId": args.build_model,
         "RequireSeparateApprover": str(args.require_separate_approver).lower(),
         "DailyRequestLimitPerTenant": args.daily_request_limit,
         "ConsoleDesiredCount": args.console_tasks,

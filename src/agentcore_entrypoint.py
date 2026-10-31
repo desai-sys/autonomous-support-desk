@@ -37,6 +37,8 @@ configure_logging("agent")
 logger = structlog.get_logger()
 
 _AGENT_MODEL = BedrockModel(model_id=config.AGENT_MODEL_ID, max_tokens=config.AGENT_MAX_TOKENS)
+_BUILD_MODEL = (BedrockModel(model_id=config.BUILD_MODEL_ID, max_tokens=config.AGENT_MAX_TOKENS)
+                if config.BUILD_MODEL_ID else _AGENT_MODEL)
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -178,6 +180,7 @@ from src.tools.deployment_tools import (
 from src.tools.provisioning_tools import launch_ec2_instance
 from src.tools.app_builder_tools import (
     delete_generated_app, deploy_generated_app, get_generated_app, prepare_app_bundle,
+    prepare_app_file, prepare_app_template,
 )
 from src.tools.aws_api_tools import call_aws_api, query_aws_api
 
@@ -268,12 +271,14 @@ DOMAIN_INTROS = {
         "WORKFLOW:\n"
         "1. If essential requirements are unclear (what it does, public or private, data to store), ask "
         "ONE short question with proposed defaults; otherwise just build it.\n"
-        "2. Write the app and call prepare_app_bundle. Fix any validation errors it returns and call it "
-        "again.\n"
+        "2. Write the app ONE FILE PER CALL with prepare_app_file (path + full content), set the "
+        "CloudFormation with prepare_app_template, then call prepare_app_bundle. Never put several "
+        "files in one call. Fix any validation errors it returns and call it again.\n"
         "3. Call deploy_generated_app with the returned app_id and version. It is queued: tell the operator "
         "what will be created, the estimated cost profile, and that they can review every file on the "
         "approval card.\n"
-        "4. To change an existing app, call get_generated_app, edit, prepare a new version, deploy it.\n"
+        "4. To change an existing app, call get_generated_app, rewrite only the changed files with "
+        "prepare_app_file, then prepare_app_bundle and deploy the new version.\n"
         "CONVENTIONS:\n"
         "- Prefer serverless: Lambda (python3.12 or nodejs20.x), API Gateway HTTP API or a Lambda function "
         "URL, DynamoDB (PAY_PER_REQUEST), S3, SQS, EventBridge schedules.\n"
@@ -286,6 +291,11 @@ DOMAIN_INTROS = {
         "actions, no admin policies, no IAM users). Pass table/bucket names via environment variables.\n"
         "- Output every URL (e.g. ApiUrl) so it is smoke-tested after deployment; make GET / return "
         "a useful response.\n"
+        "- Web pages, games and other browser UIs: one Lambda whose GET / returns a single "
+        "self-contained HTML page (inline CSS and JavaScript, Content-Type text/html; all game/UI "
+        "logic runs in the browser), exposed with AWS::Lambda::Url (AuthType NONE, which makes it "
+        "public — say so in the plan) plus the matching AWS::Lambda::Permission "
+        "(lambda:InvokeFunctionUrl, Principal '*', FunctionUrlAuthType NONE). Output the URL as AppUrl.\n"
         "- Include a README.md explaining endpoints and usage. Keep apps small and readable."
     ),
 }
@@ -457,7 +467,8 @@ for _group in (TOOLS_COMPUTE, TOOLS_STORAGE, TOOLS_NETWORK, TOOLS_DATABASE,
 
 
 TOOLS_BUILD = [
-    prepare_app_bundle, get_generated_app, deploy_generated_app, delete_generated_app,
+    prepare_app_file, prepare_app_template, prepare_app_bundle, get_generated_app,
+    deploy_generated_app, delete_generated_app,
     validate_cfn_template, query_aws_api, call_aws_api,
     search_resource_by_name, describe_agent_capabilities,
 ]
@@ -602,8 +613,10 @@ def _chat(payload: dict, caller: dict) -> dict:
             max_tools = max(max_tools, tools)
         except Exception as e:  # one account failing shouldn't abort the rest
             logger.exception("account_run_failed", account_id=account_id)
-            per_account.append({"account_id": account_id, "response": f"Account error: {e}",
-                                "domain": "unknown", "error": type(e).__name__})
+            where = f"in account {account_id}" if account_id else "in the platform account"
+            per_account.append({"account_id": account_id, "domain": "unknown", "error": type(e).__name__,
+                                "response": f"The request failed {where}: {e}\n\nNothing was changed. "
+                                            f"Try again, or split the request into smaller steps."})
         queued.extend(gate.queued)
 
     if len(per_account) == 1:
@@ -784,9 +797,21 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
         "exactly: ESCALATE - [brief reason why]"
     )
 
-    agent = Agent(model=_AGENT_MODEL, system_prompt=system_prompt, tools=tools,
-                  hooks=[gate], callback_handler=None)
-    text = _THINKING_RE.sub("", str(agent(prompt))).strip()
+    model = _BUILD_MODEL if "build" in domains else _AGENT_MODEL
+    try:
+        result = Agent(model=model, system_prompt=system_prompt, tools=tools,
+                       hooks=[gate], callback_handler=None)(prompt)
+    except Exception as e:
+        # Models occasionally emit a malformed tool call when its input is large. Retry once
+        # with a fresh agent and a nudge towards smaller calls.
+        if "ToolUse" not in str(e) and "invalid sequence" not in str(e):
+            raise
+        logger.warning("tool_use_stream_error_retry", error=str(e))
+        result = Agent(model=model, tools=tools, hooks=[gate], callback_handler=None,
+                       system_prompt=system_prompt + (
+                           "\n\nYour previous attempt failed because a tool call was malformed. "
+                           "Keep every tool call small: one file per call, plain text content."))(prompt)
+    text = _THINKING_RE.sub("", str(result)).strip()
     return text, domains, len(tools)
 
 

@@ -3,8 +3,10 @@ App builder: the agent writes an application (code + CloudFormation) from a
 description, the operator reviews it on the approval card, and one approval
 deploys it into the target account and smoke-tests it.
 
-  prepare_app_bundle    validate + store a new draft version (no change to any account)
-  get_generated_app     read a draft back, to iterate on it
+  prepare_app_file      write one file into the request's draft      (no change to any account)
+  prepare_app_template  set the draft's CloudFormation template       (no change to any account)
+  prepare_app_bundle    validate + store the draft as a new version   (no change to any account)
+  get_generated_app     read a version back into the draft, to iterate on it
   deploy_generated_app  create/update the stack, then call its URL outputs   [approval-gated]
   delete_generated_app  delete the stack                                      [approval-gated]
 """
@@ -48,36 +50,75 @@ def _stack_name(app_id: str, stack_name: str) -> str:
 
 
 @tool
-def prepare_app_bundle(app_id: str, description: str, files: str, template: str,
-                       region: str = 'us-east-1') -> str:
-    """Save a generated application (code + CloudFormation template) as a new draft version for review.
+def prepare_app_file(app_id: str, path: str, content: str) -> str:
+    """Write ONE file of a generated application into the current draft. Call once per file.
 
-    Changes nothing in any AWS account. Call it after writing the app, then call
-    deploy_generated_app with the returned app_id and version so the operator can
-    review the files and approve.
+    Changes nothing in any AWS account. Code goes under src/ (zipped as the Lambda package with
+    src/ stripped, so src/app.py has handler "app.handler"); also write a README.md.
 
     Args:
         app_id: Short lowercase name, e.g. url-shortener (letters, digits, hyphens).
+        path: File path, e.g. src/app.py or README.md.
+        content: The complete file content.
+
+    Returns:
+        JSON with the files in the draft so far.
+    """
+    path = (path or "").strip()
+    if path.startswith("./"):
+        path = path[2:]
+    if not path or path.startswith("/") or ".." in path.split("/") or "\\" in path:
+        return _fail("invalid_path", f"Unsafe or empty file path {path!r}.")
+    draft = request_context.draft(app_id)
+    draft["files"][path] = content
+    return json.dumps({"status": "success", "app_id": app_id, "files": sorted(draft["files"])})
+
+
+@tool
+def prepare_app_template(app_id: str, template: str) -> str:
+    """Set the CloudFormation template (YAML) of the current draft.
+
+    Changes nothing in any AWS account. The template must declare String parameters
+    ArtifactBucket and ArtifactKey and use them as the Lambda code location.
+
+    Args:
+        app_id: The app's name.
+        template: The complete CloudFormation YAML.
+
+    Returns:
+        JSON confirmation.
+    """
+    request_context.draft(app_id)["template"] = template
+    return json.dumps({"status": "success", "app_id": app_id, "template_chars": len(template)})
+
+
+@tool
+def prepare_app_bundle(app_id: str, description: str, region: str = 'us-east-1') -> str:
+    """Validate the current draft (files + template) and save it as a new reviewable version.
+
+    Changes nothing in any AWS account. Call after prepare_app_file / prepare_app_template;
+    then call deploy_generated_app with the returned version.
+
+    Args:
+        app_id: The app's name.
         description: One paragraph: what the app does and which resources it creates.
-        files: JSON object {path: file content}. Code goes under src/ (zipped as the Lambda
-            package with src/ stripped, so src/app.py has handler "app.handler"). Add a README.md.
-        template: CloudFormation YAML. Must declare String parameters ArtifactBucket and
-            ArtifactKey and use them as the Lambda code location.
         region: Region the app will be deployed to (the template is validated there).
 
     Returns:
         JSON with app_id, version, file list and warnings, or the validation errors to fix.
     """
+    draft = request_context.draft(app_id)
+    if not draft["files"] and not draft["template"]:
+        return _fail("empty_draft", "The draft has no files or template.",
+                     "Write each file with prepare_app_file and the template with prepare_app_template first.")
+    template = draft["template"]
     try:
-        file_map = json.loads(files) if isinstance(files, str) else files
-    except ValueError as e:
-        return _fail("invalid_files", f"files is not valid JSON: {e}",
-                     'Pass a JSON object such as {"src/app.py": "...", "README.md": "..."}.')
-    try:
-        manifest = _store().save(request_context.tenant_id(), app_id, description, file_map,
+        manifest = _store().save(request_context.tenant_id(), app_id, description, dict(draft["files"]),
                                  template, request_context.user_id())
     except BundleError as e:
-        return _fail("invalid_bundle", str(e), "Fix every listed problem and call prepare_app_bundle again.")
+        return _fail("invalid_bundle", str(e),
+                     "Fix the listed problems with prepare_app_file / prepare_app_template, then call "
+                     "prepare_app_bundle again.")
     except Exception as e:
         logger.error("prepare_app_bundle_failed", error=str(e))
         return _fail("storage_error", f"Could not save the draft: {e}")
@@ -94,13 +135,17 @@ def prepare_app_bundle(app_id: str, description: str, files: str, template: str,
         "warnings": manifest["warnings"], "template_validation": validation,
         "next_step": (f"Call deploy_generated_app(app_id='{app_id}', version={manifest['version']}, "
                       f"region='{region}') so the operator can review and approve."
-                      if validation == "valid" else "Fix the template and call prepare_app_bundle again."),
+                      if validation == "valid"
+                      else "Fix the template with prepare_app_template and call prepare_app_bundle again."),
     })
 
 
 @tool
 def get_generated_app(app_id: str, version: int = 0) -> str:
-    """Read a generated app's files and template (version 0 = latest), e.g. to change it.
+    """Read a generated app's files and template (version 0 = latest) and load them into the draft.
+
+    To change an app: call this, rewrite only the files that change with prepare_app_file (and
+    prepare_app_template if needed), then prepare_app_bundle for a new version.
 
     Args:
         app_id: The app's name.
@@ -111,11 +156,14 @@ def get_generated_app(app_id: str, version: int = 0) -> str:
     """
     try:
         manifest, files, template = _store().load(request_context.tenant_id(), app_id, version)
-        return json.dumps({"manifest": manifest, "files": files, "template": template})
     except BundleError as e:
         return _fail("not_found", str(e))
     except Exception as e:
         return _fail("storage_error", f"Could not read the app: {e}")
+    draft = request_context.draft(app_id)
+    draft["files"] = dict(files)
+    draft["template"] = template
+    return json.dumps({"manifest": manifest, "files": files, "template": template})
 
 
 def _smoke_test(outputs: dict) -> list:
