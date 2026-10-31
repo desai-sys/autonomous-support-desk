@@ -1,0 +1,826 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudOps application: the agent (Bedrock AgentCore Runtime), the console
+  (ECS Fargate behind an ALB and CloudFront, signed in with Cognito), the hourly
+  learning loop, alarms and a dashboard. Deployed by scripts/deploy.py after
+  infra/foundation.yaml; most parameters are that stack's outputs.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: cloudops
+    AllowedPattern: "^[a-z][a-z0-9]{2,15}$"
+  Environment:
+    Type: String
+    Default: prod
+  # Foundation outputs
+  ArtifactBucketName: {Type: String}
+  KnowledgeBucketName: {Type: String}
+  TicketsTableName: {Type: String}
+  AuditTableName: {Type: String}
+  ActionsTableName: {Type: String}
+  AccountsTableName: {Type: String}
+  UsageTableName: {Type: String}
+  KnowledgeBaseId: {Type: String}
+  KnowledgeBaseArn: {Type: String}
+  DataSourceId: {Type: String}
+  UserPoolId: {Type: String}
+  UserPoolDomain: {Type: String}
+  CookieSecretArn: {Type: String}
+  ConsoleRepositoryUri: {Type: String}
+  # Build outputs (scripts/deploy.py)
+  ConsoleImageTag: {Type: String}
+  AgentCodeKey:
+    Type: String
+    Description: S3 key of the agent package zip in the artifact bucket.
+  # Secrets read by scripts/deploy.py from Secrets Manager
+  CrossAccountExternalId: {Type: String, NoEcho: true}
+  OriginVerifySecret: {Type: String, NoEcho: true}
+  CloudFrontPrefixListId:
+    Type: String
+    Description: Managed prefix list com.amazonaws.global.cloudfront.origin-facing in this region.
+  # Behaviour
+  PlatformAccountAccess:
+    Type: String
+    Default: PowerUser
+    AllowedValues: [PowerUser, ReadOnly]
+    Description: What the agent may do in this (the platform) account once a change is approved.
+  CrossAccountRoleName: {Type: String, Default: CloudOpsCrossAccountRole}
+  AgentModelId: {Type: String, Default: us.amazon.nova-pro-v1:0}
+  RouterModelId: {Type: String, Default: us.amazon.nova-micro-v1:0}
+  RequireSeparateApprover:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  DailyRequestLimitPerTenant: {Type: Number, Default: 0, MinValue: 0}
+  ConsoleDesiredCount: {Type: Number, Default: 2, MinValue: 1}
+  AlarmEmail: {Type: String, Default: ""}
+  # Optional custom domain (certificate must be in us-east-1 for CloudFront)
+  DomainName: {Type: String, Default: ""}
+  CertificateArn: {Type: String, Default: ""}
+
+Conditions:
+  IsPowerUser: !Equals [!Ref PlatformAccountAccess, PowerUser]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  HasDomain: !And [!Not [!Equals [!Ref DomainName, ""]], !Not [!Equals [!Ref CertificateArn, ""]]]
+  # CloudFront web ACLs can only be created in us-east-1.
+  CreateWaf: !Equals [!Ref "AWS::Region", us-east-1]
+
+Resources:
+  # ════════════════════════════════════════════════════════════════════════════
+  # Agent — Bedrock AgentCore Runtime (direct code deployment from S3)
+  # ════════════════════════════════════════════════════════════════════════════
+  AgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-agent-runtime-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}
+      ManagedPolicyArns: !If
+        - IsPowerUser
+        - [!Sub "arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess",
+           !Sub "arn:${AWS::Partition}:iam::aws:policy/IAMReadOnlyAccess"]
+        - [!Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"]
+      Policies:
+        - PolicyName: agent-platform
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Models
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: PlatformTables
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}/index/*"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsageTableName}"
+              - Sid: AgentCodeAndUploads
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/agent/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/uploads/*"
+              - Sid: AssumeManagedAccountRoles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${CrossAccountRoleName}"
+              - Sid: RuntimeLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: Tracing
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT,
+                         bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource: "*"
+
+  # PowerUserAccess excludes IAM. Deploy tools only create and pass their own
+  # CloudOps service roles, so IAM writes are limited to those names.
+  AgentRuntimeIamPolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: IsPowerUser
+    Properties:
+      RoleName: !Ref AgentRuntimeRole
+      PolicyName: cloudops-service-roles
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [iam:CreateRole, iam:TagRole, iam:AttachRolePolicy, iam:PassRole,
+                     iam:CreateInstanceProfile, iam:AddRoleToInstanceProfile]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cloudops-*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CloudOps*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/CloudOps*"
+          - Effect: Deny
+            Action: iam:AttachRolePolicy
+            Resource: "*"
+            Condition:
+              ArnNotEquals:
+                iam:PolicyARN:
+                  - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                  - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+                  - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Sub "${AppName}_agent"
+      Description: CloudOps action agent
+      RoleArn: !GetAtt AgentRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Runtime: PYTHON_3_12
+          EntryPoint: [agent_main.py]
+          Code:
+            S3:
+              Bucket: !Ref ArtifactBucketName
+              Prefix: !Ref AgentCodeKey
+      NetworkConfiguration: {NetworkMode: PUBLIC}
+      ProtocolConfiguration: HTTP
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: 900
+        MaxLifetime: 28800
+      EnvironmentVariables:
+        CLOUDOPS_ENV: !Ref Environment
+        TICKETS_TABLE: !Ref TicketsTableName
+        AUDIT_TABLE: !Ref AuditTableName
+        ACTIONS_TABLE: !Ref ActionsTableName
+        ACCOUNTS_TABLE: !Ref AccountsTableName
+        USAGE_TABLE: !Ref UsageTableName
+        ARTIFACT_BUCKET: !Ref ArtifactBucketName
+        AGENT_MODEL_ID: !Ref AgentModelId
+        ROUTER_MODEL_ID: !Ref RouterModelId
+        CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
+        CROSS_ACCOUNT_EXTERNAL_ID: !Ref CrossAccountExternalId
+        REQUIRE_SEPARATE_APPROVER: !Ref RequireSeparateApprover
+        DAILY_REQUEST_LIMIT_PER_TENANT: !Ref DailyRequestLimitPerTenant
+      Tags:
+        App: !Ref AppName
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Network — 2 AZs, public subnets for the ALB/NAT, private subnets for tasks
+  # ════════════════════════════════════════════════════════════════════════════
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Sub "${AppName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway}
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${AppName}-public-a"}]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${AppName}-public-b"}]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${AppName}-private-a"}]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${AppName}-private-b"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable}
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable}
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Console — ALB (CloudFront-only) → ECS Fargate (ARM64)
+  # ════════════════════════════════════════════════════════════════════════════
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Console load balancer - CloudFront origin-facing addresses only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+
+  ConsoleSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Console tasks - traffic from the load balancer only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: "900"}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: "true"}
+
+  ConsoleTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 8501
+      TargetType: ip
+      HealthCheckPath: /_stcore/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        # Streamlit keeps session state in the task, so pin each browser to one task.
+        - {Key: stickiness.enabled, Value: "true"}
+        - {Key: stickiness.type, Value: lb_cookie}
+        - {Key: stickiness.lb_cookie.duration_seconds, Value: "86400"}
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: "403", ContentType: text/plain, MessageBody: Forbidden}
+
+  FromCloudFrontRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig: {HttpHeaderName: X-Origin-Verify, Values: [!Ref OriginVerifySecret]}
+      Actions:
+        - {Type: forward, TargetGroupArn: !Ref ConsoleTargetGroup}
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppName}-${Environment}"
+      ClusterSettings: [{Name: containerInsights, Value: enabled}]
+
+  ConsoleLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AppName}/console"
+      RetentionInDays: 90
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: console-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref CookieSecretArn, !Ref OidcClientSecret]
+
+  ConsoleTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: console
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeAgent
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: [!GetAtt AgentRuntime.AgentRuntimeArn, !Sub "${AgentRuntime.AgentRuntimeArn}/*"]
+              - Sid: Tables
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                         dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}/index/*"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}/index/*"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsageTableName}"
+              - Sid: Uploads
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/uploads/*"
+              - Sid: UploadBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}"
+              - Sid: KnowledgeDocuments
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${KnowledgeBucketName}/resolutions/*"
+              - Sid: KnowledgeBase
+                Effect: Allow
+                Action: [bedrock:Retrieve, bedrock:StartIngestionJob]
+                Resource: !Ref KnowledgeBaseArn
+
+  ConsoleTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-console"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      RuntimePlatform: {CpuArchitecture: ARM64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ConsoleTaskRole.Arn
+      ContainerDefinitions:
+        - Name: console
+          Image: !Sub "${ConsoleRepositoryUri}:${ConsoleImageTag}"
+          Essential: true
+          ReadonlyRootFilesystem: false
+          PortMappings: [{ContainerPort: 8501, Protocol: tcp}]
+          Environment:
+            - {Name: CLOUDOPS_ENV, Value: !Ref Environment}
+            - {Name: AUTH_MODE, Value: oidc}
+            - {Name: AGENT_RUNTIME_ARN, Value: !GetAtt AgentRuntime.AgentRuntimeArn}
+            - {Name: AGENT_RUNTIME_ROLE_ARN, Value: !GetAtt AgentRuntimeRole.Arn}
+            - {Name: TICKETS_TABLE, Value: !Ref TicketsTableName}
+            - {Name: AUDIT_TABLE, Value: !Ref AuditTableName}
+            - {Name: ACTIONS_TABLE, Value: !Ref ActionsTableName}
+            - {Name: ACCOUNTS_TABLE, Value: !Ref AccountsTableName}
+            - {Name: USAGE_TABLE, Value: !Ref UsageTableName}
+            - {Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucketName}
+            - {Name: KB_BUCKET, Value: !Ref KnowledgeBucketName}
+            - {Name: KNOWLEDGE_BASE_ID, Value: !Ref KnowledgeBaseId}
+            - {Name: DATA_SOURCE_ID, Value: !Ref DataSourceId}
+            - {Name: CROSS_ACCOUNT_ROLE_NAME, Value: !Ref CrossAccountRoleName}
+            - {Name: CROSS_ACCOUNT_EXTERNAL_ID, Value: !Ref CrossAccountExternalId}
+            - {Name: REQUIRE_SEPARATE_APPROVER, Value: !Ref RequireSeparateApprover}
+            - {Name: OIDC_CLIENT_ID, Value: !Ref OidcClient}
+            - {Name: OIDC_METADATA_URL, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration"}
+            - {Name: OIDC_REDIRECT_URI, Value: !Sub
+                ["https://${Host}/oauth2callback", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]}
+          Secrets:
+            - {Name: OIDC_CLIENT_SECRET, ValueFrom: !Ref OidcClientSecret}
+            - {Name: OIDC_COOKIE_SECRET, ValueFrom: !Ref CookieSecretArn}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ConsoleLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: console
+
+  ConsoleService:
+    Type: AWS::ECS::Service
+    DependsOn: FromCloudFrontRule
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ConsoleTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref ConsoleDesiredCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref ConsoleSecurityGroup]
+      LoadBalancers:
+        - {ContainerName: console, ContainerPort: 8501, TargetGroupArn: !Ref ConsoleTargetGroup}
+
+  ConsoleScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub "service/${Cluster}/${ConsoleService.Name}"
+      MinCapacity: !Ref ConsoleDesiredCount
+      MaxCapacity: 6
+  ConsoleCpuScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cpu-target
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ConsoleScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: {PredefinedMetricType: ECSServiceAverageCPUUtilization}
+
+  # ── Edge: CloudFront (HTTPS) + optional WAF ────────────────────────────────
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: CreateWaf
+    Properties:
+      Name: !Sub "${AppName}-console"
+      Scope: CLOUDFRONT
+      DefaultAction: {Allow: {}}
+      VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: !Sub "${AppName}-console"}
+      Rules:
+        - Name: rate-limit
+          Priority: 0
+          Action: {Block: {}}
+          Statement: {RateBasedStatement: {Limit: 2000, AggregateKeyType: IP}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: rate-limit}
+        - Name: common
+          Priority: 1
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              # Code uploads are large multipart bodies.
+              RuleActionOverrides: [{Name: SizeRestrictions_BODY, ActionToUse: {Count: {}}}]
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: common}
+        - Name: known-bad-inputs
+          Priority: 2
+          OverrideAction: {None: {}}
+          Statement: {ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: known-bad-inputs}
+        - Name: ip-reputation
+          Priority: 3
+          OverrideAction: {None: {}}
+          Statement: {ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList}}
+          VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ip-reputation}
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AppName} console"
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Aliases: !If [HasDomain, [!Ref DomainName], !Ref "AWS::NoValue"]
+        ViewerCertificate: !If
+          - HasDomain
+          - {AcmCertificateArn: !Ref CertificateArn, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021}
+          - {CloudFrontDefaultCertificate: true}
+        WebACLId: !If [CreateWaf, !GetAtt WebAcl.Arn, !Ref "AWS::NoValue"]
+        Origins:
+          - Id: console-alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+            OriginCustomHeaders:
+              - {HeaderName: X-Origin-Verify, HeaderValue: !Ref OriginVerifySecret}
+        DefaultCacheBehavior:
+          TargetOriginId: console-alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # Managed-AllViewer
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+
+  # ── Cognito app client (needs the console URL for its callback) ────────────
+  OidcClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      ClientName: !Sub "${AppName}-console"
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub ["https://${Host}/oauth2callback", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]
+      LogoutURLs:
+        - !Sub ["https://${Host}/", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 12
+      TokenValidityUnits: {IdToken: minutes, AccessToken: minutes, RefreshToken: hours}
+      ReadAttributes: [email, email_verified, name, custom:tenant_id]
+      # Users must not be able to change their own tenant.
+      WriteAttributes: [email, name]
+
+  OidcClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/console-oidc-client-secret"
+      SecretString: !GetAtt OidcClient.ClientSecret
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Learning loop — hourly ECS task that feeds resolved tickets to the KB
+  # ════════════════════════════════════════════════════════════════════════════
+  LearningLoopTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-learning-loop"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: {CpuArchitecture: ARM64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ConsoleTaskRole.Arn
+      ContainerDefinitions:
+        - Name: learning-loop
+          Image: !Sub "${ConsoleRepositoryUri}:${ConsoleImageTag}"
+          Essential: true
+          Command: [python, -m, src.jobs.learning_loop]
+          Environment:
+            - {Name: CLOUDOPS_ENV, Value: !Ref Environment}
+            - {Name: AUTH_MODE, Value: oidc}
+            - {Name: AGENT_RUNTIME_ARN, Value: !GetAtt AgentRuntime.AgentRuntimeArn}
+            - {Name: AGENT_RUNTIME_ROLE_ARN, Value: !GetAtt AgentRuntimeRole.Arn}
+            - {Name: TICKETS_TABLE, Value: !Ref TicketsTableName}
+            - {Name: AUDIT_TABLE, Value: !Ref AuditTableName}
+            - {Name: ACTIONS_TABLE, Value: !Ref ActionsTableName}
+            - {Name: ACCOUNTS_TABLE, Value: !Ref AccountsTableName}
+            - {Name: USAGE_TABLE, Value: !Ref UsageTableName}
+            - {Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucketName}
+            - {Name: KB_BUCKET, Value: !Ref KnowledgeBucketName}
+            - {Name: KNOWLEDGE_BASE_ID, Value: !Ref KnowledgeBaseId}
+            - {Name: DATA_SOURCE_ID, Value: !Ref DataSourceId}
+            - {Name: CROSS_ACCOUNT_ROLE_NAME, Value: !Ref CrossAccountRoleName}
+            - {Name: CROSS_ACCOUNT_EXTERNAL_ID, Value: !Ref CrossAccountExternalId}
+            - {Name: REQUIRE_SEPARATE_APPROVER, Value: !Ref RequireSeparateApprover}
+            - {Name: OIDC_CLIENT_ID, Value: !Ref OidcClient}
+            - {Name: OIDC_METADATA_URL, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration"}
+            - {Name: OIDC_REDIRECT_URI, Value: !Sub
+                ["https://${Host}/oauth2callback", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ConsoleLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: learning-loop
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}
+      Policies:
+        - PolicyName: run-learning-loop
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AppName}-learning-loop:*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt ConsoleTaskRole.Arn]
+
+  LearningLoopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AppName}-learning-loop"
+      ScheduleExpression: rate(1 hour)
+      FlexibleTimeWindow: {Mode: FLEXIBLE, MaximumWindowInMinutes: 15}
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        EcsParameters:
+          TaskDefinitionArn: !Ref LearningLoopTaskDefinition
+          LaunchType: FARGATE
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: DISABLED
+              Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+              SecurityGroups: [!Ref ConsoleSecurityGroup]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Observability
+  # ════════════════════════════════════════════════════════════════════════════
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AppName}-alarms"
+      KmsMasterKeyId: alias/aws/sns
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties: {TopicArn: !Ref AlarmTopic, Protocol: email, Endpoint: !Ref AlarmEmail}
+
+  ConsoleUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Console tasks failing load balancer health checks
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt ConsoleTargetGroup.TargetGroupFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Console5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Console returning 5xx errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  AgentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Agent requests failing
+      Namespace: CloudOps
+      MetricName: RequestErrors
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+        - {Name: Service, Value: agent-chat}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  FailedActionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Approved changes failing when executed
+      Namespace: CloudOps
+      MetricName: Actions
+      Dimensions:
+        - {Name: Environment, Value: !Ref Environment}
+        - {Name: Status, Value: failed}
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AppName}-${Environment}"
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Agent requests", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+            "metrics": [["CloudOps", "Requests", "Environment", "${Environment}", "Service", "agent-chat"],
+                        [".", "RequestErrors", ".", ".", ".", "."]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Agent latency (p90, ms)", "region": "${AWS::Region}", "stat": "p90", "period": 300,
+            "metrics": [["CloudOps", "RequestLatency", "Environment", "${Environment}", "Service", "agent-chat"],
+                        ["...", "agent-execute"]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Approved actions", "region": "${AWS::Region}", "stat": "Sum", "period": 900,
+            "metrics": [["CloudOps", "Actions", "Environment", "${Environment}", "Status", "succeeded"],
+                        ["...", "failed"]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Console", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+            "metrics": [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}"],
+                        [".", "HTTPCode_Target_5XX_Count", ".", "."]]}}
+        ]}
+
+Outputs:
+  ConsoleUrl:
+    Value: !Sub ["https://${Host}", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]
+  CloudFrontDomainName: {Value: !GetAtt Distribution.DomainName}
+  AgentRuntimeArn: {Value: !GetAtt AgentRuntime.AgentRuntimeArn}
+  AgentRuntimeRoleArn: {Value: !GetAtt AgentRuntimeRole.Arn}
+  ClusterName: {Value: !Ref Cluster}
+  ConsoleServiceName: {Value: !GetAtt ConsoleService.Name}
+  AlarmTopicArn: {Value: !Ref AlarmTopic}
+  CognitoLoginDomain: {Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"}

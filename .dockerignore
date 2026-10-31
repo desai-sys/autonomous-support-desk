@@ -1,77 +1,12 @@
-# Build artifacts
-build/
-dist/
-*.egg-info/
-*.egg
-
-# Python cache
-__pycache__/
-__pycache__*
-*.py[cod]
-*$py.class
-*.so
-.Python
-
-# Virtual environments
-.venv/
-.env
-venv/
-env/
-ENV/
-
-# Node.js
-node_modules/
-
-# Testing
-.pytest_cache/
-.coverage
-.coverage*
-htmlcov/
-.tox/
-*.cover
-.hypothesis/
-.mypy_cache/
-.ruff_cache/
-
-# Development
-*.log
-*.bak
-*.swp
-*.swo
-*~
-.DS_Store
-
-# IDEs
-.vscode/
-.idea/
-
-# Version control
-.git/
-.gitignore
-.gitattributes
-
-# Documentation
-docs/
-
-# CI/CD
-.github/
-.gitlab-ci.yml
-.travis.yml
-
-# Project specific
-tests/
-data/
-local_model/
-templates/
-
-# Bedrock AgentCore specific - keep config but exclude runtime files
-.bedrock_agentcore.yaml
-.dockerignore
-.bedrock_agentcore/
-
-# Keep wheelhouse for offline installations
-# wheelhouse/
-
-# Monorepo directories
-cdk/
-terraform/
+# The console build context is assembled by scripts/deploy.py; this file only
+# matters for manual `docker build .` runs.
+**/__pycache__
+**/*.py[cod]
+.git
+.venv
+venv
+build
+.deploy
+tests
+docs
+.streamlit/secrets.toml

@@ -1,0 +1,8 @@
+# Console container (Streamlit on ECS Fargate).
+streamlit==1.66.1
+Authlib==1.9.1
+strands-agents==1.63.0
+boto3==1.43.123
+botocore==1.43.123
+pydantic==2.13.5
+structlog==26.1.0

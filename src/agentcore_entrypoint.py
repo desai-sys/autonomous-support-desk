@@ -1,40 +1,44 @@
 """
-AWS Bedrock AgentCore Entrypoint - Multi-Agent Architecture.
+CloudOps Action Agent — AgentCore runtime entrypoint.
 
-Production-grade design: instead of one 256-tool agent, the router classifies
-the query and loads ONLY the relevant domain's tools (~30-50 per specialist).
+Two request modes:
 
-Deploy with:
-    agentcore configure --entrypoint src/agentcore_entrypoint.py --non-interactive
-    agentcore deploy
+  chat     Route the prompt to 1-2 tool domains (DomainRouter, Nova Micro), run
+           a Strands agent (Nova Pro) over that focused tool set in each target
+           account, and return its answer. Mutating tool calls never run here:
+           the ApprovalGate queues them as pending actions, returned in
+           ``pending_actions`` for a person to approve in the console.
+  execute  Run approved pending actions exactly as recorded (no LLM involved).
+
+Deployed by infra/app.yaml (AWS::BedrockAgentCore::Runtime, code from S3)
+through agent_main.py.
 """
 
-import os
+import json
 import re
 import time
-import json
-import boto3
-from datetime import datetime
+
+import structlog
 from bedrock_agentcore import BedrockAgentCoreApp
-from strands import Agent, tool
+from strands import Agent
 from strands.models import BedrockModel
 
-# Account-aware client context (cross-account / multi-account support)
-from src.core.aws_clients import use_account, get_active_account
+import config
+from src.agents.router import DomainRouter
+from src.core.accounts import AccountRegistry
+from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating
+from src.core.aws_clients import base_account_id, boto3, get_active_account, use_account
+from src.core.monitoring import configure_logging, metrics
+from src.core.security import Permission, ROLE_PERMISSIONS, UserRole, security_manager
+from src.core.usage import usage_meter
+
+configure_logging("agent")
+logger = structlog.get_logger()
+
+_AGENT_MODEL = BedrockModel(model_id=config.AGENT_MODEL_ID, max_tokens=config.AGENT_MAX_TOKENS)
 
 # ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
-# Router uses Nova Micro (ultra-fast classification, ~50ms)
-# Specialist agents use Nova Pro (powerful reasoning with focused tool set)
-_AGENT_MODEL = BedrockModel(
-    model_id="us.amazon.nova-pro-v1:0",
-    max_tokens=8192,
-)
-
-# ---------------------------------------------------------------------------
-# Import tool modules (unchanged)
+# Tools
 # ---------------------------------------------------------------------------
 
 from src.tools.compute_tools import (
@@ -178,153 +182,78 @@ from src.tools.artifact_tools import (
     deploy_artifact_to_static_site,
 )
 
-# Import enterprise core modules
-from src.core.monitoring import monitoring_manager, monitor_performance
-from src.core.security import security_manager
-from src.core.multi_tenant import tenant_manager
-
-# Import the domain router
-from src.agents.router import DomainRouter
 
 
 # ---------------------------------------------------------------------------
-# Domain Router instance
+# System prompts
 # ---------------------------------------------------------------------------
 
-router = DomainRouter(region="us-east-1")
+COMMON_RULES = (
+    "RULES:\n"
+    "- Investigate with read-only tools first and base every statement on tool output. "
+    "If you search for a resource and cannot find it, say so; never substitute a different "
+    "resource or invent identifiers.\n"
+    "- Changes are approval-gated by the platform: when a change is needed, call the tool "
+    "with the exact parameters. The call is queued (you will see 'NOT EXECUTED YET ... "
+    "queued as action <id>'). Then explain precisely what each queued action will do, its "
+    "risk and how to roll it back. Never say a change was made unless a tool result shows it.\n"
+    "- Only queue changes the operator asked for or clearly needs; one action per change.\n"
+    "- Always state the AWS account and region you inspected or will change.\n"
+    "- Respond in plain English with short bullet points, not raw JSON.\n"
+    "- Chain multiple tools when needed for full context."
+)
 
-
-# ---------------------------------------------------------------------------
-# Domain-specific system prompts
-# ---------------------------------------------------------------------------
-
-DOMAIN_PROMPTS = {
+DOMAIN_INTROS = {
     "compute": (
-        "You are an AWS Compute specialist. You manage EC2, Lambda, ECS, EKS, Batch, "
-        "SageMaker, App Runner, Lightsail, and CloudWatch metrics/alarms/logs.\n\n"
-        "Always use list_ec2_instances to find instances first, analyze before acting, "
-        "confirm before changes.\n\n"
-        "RULES:\n"
-        "- If you search for a resource and cannot find it, say so clearly. "
-        "Never substitute a different resource.\n"
-        "- For read operations, execute immediately. For write/delete operations, "
-        "describe and ask for confirmation.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the "
-        "previously proposed action.\n"
-        "- Chain multiple tools when needed for full context."
+        "You are an AWS Compute specialist. You manage EC2, Lambda, ECS, EKS, Batch, SageMaker, "
+        "App Runner, Lightsail, and CloudWatch metrics/alarms/logs. Use list_ec2_instances to "
+        "find instances first and analyze before proposing changes."
     ),
-
     "storage": (
-        "You are an AWS Storage specialist. You manage S3 buckets, EBS volumes, EFS, "
-        "ECR, Backup, DataSync, and Transfer Family.\n\n"
-        "For S3, use list_s3_buckets first. For security checks, use list_public_s3_buckets.\n\n"
-        "RULES:\n"
-        "- If you search for a resource and cannot find it, say so clearly. "
-        "Never substitute a different resource.\n"
-        "- For read operations, execute immediately. For write/delete operations, "
-        "describe and ask for confirmation.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the "
-        "previously proposed action.\n"
-        "- Always check versioning and encryption status when analyzing buckets."
+        "You are an AWS Storage specialist. You manage S3 buckets, EBS volumes, EFS, ECR, Backup, "
+        "DataSync, and Transfer Family. For S3 use list_s3_buckets first; for security checks use "
+        "list_public_s3_buckets. Check versioning and encryption when analyzing buckets."
     ),
-
     "network": (
         "You are an AWS Network specialist. You manage VPCs, security groups, load balancers, "
-        "Route53, CloudFront, API Gateway, SNS, SQS, Kinesis, and MSK.\n\n"
-        "For security groups use list_security_groups then analyze_security_group. "
-        "For DNS use list_hosted_zones first.\n\n"
-        "RULES:\n"
-        "- If you search for a resource and cannot find it, say so clearly. "
-        "Never substitute a different resource.\n"
-        "- For read operations, execute immediately. For write/delete operations, "
-        "describe and ask for confirmation.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the "
-        "previously proposed action.\n"
-        "- Flag overly permissive rules (0.0.0.0/0) as security concerns."
+        "Route53, CloudFront, API Gateway, SNS, SQS, Kinesis, and MSK. For security groups use "
+        "list_security_groups then analyze_security_group; for DNS use list_hosted_zones first. "
+        "Flag overly permissive rules (0.0.0.0/0)."
     ),
-
     "database": (
-        "You are an AWS Database specialist. You manage RDS, DynamoDB, ElastiCache, "
-        "DocumentDB, Redshift, Neptune, OpenSearch, Glue, Athena, Timestream, QLDB, and DMS.\n\n"
-        "Use list_ tools first to discover resources. For RDS, check status and endpoints.\n\n"
-        "RULES:\n"
-        "- If you search for a resource and cannot find it, say so clearly. "
-        "Never substitute a different resource.\n"
-        "- For read operations, execute immediately. For write/delete operations, "
-        "describe and ask for confirmation.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the "
-        "previously proposed action.\n"
-        "- Always mention backup status and storage encryption when analyzing databases."
+        "You are an AWS Database specialist. You manage RDS, DynamoDB, ElastiCache, DocumentDB, "
+        "Redshift, Neptune, OpenSearch, Glue, Athena, Timestream, QLDB, and DMS. Use list_ tools "
+        "first; mention backup status and storage encryption when analyzing databases."
     ),
-
     "security": (
-        "You are an AWS Security specialist. You manage IAM, GuardDuty, WAF, KMS, "
-        "Secrets Manager, CloudTrail, Inspector, Macie, Config, Shield, and Access Analyzer.\n\n"
-        "Focus on findings and compliance. For IAM, check MFA and unused credentials.\n\n"
-        "RULES:\n"
-        "- If you search for a resource and cannot find it, say so clearly. "
-        "Never substitute a different resource.\n"
-        "- For read operations, execute immediately. For write/delete operations, "
-        "describe and ask for confirmation.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the "
-        "previously proposed action.\n"
-        "- Always highlight critical findings and recommend remediation steps."
+        "You are an AWS Security specialist. You manage IAM, GuardDuty, WAF, KMS, Secrets Manager, "
+        "CloudTrail, Inspector, Macie, Config, Shield, and Access Analyzer. Focus on findings and "
+        "compliance; for IAM check MFA and unused credentials; highlight critical findings."
     ),
-
     "ops": (
         "You are an AWS Operations specialist. You manage costs, budgets, CloudFormation, "
-        "CodePipeline, SSM, Step Functions, CloudWatch, health events, Trusted Advisor, "
-        "and service quotas.\n\n"
-        "For costs use get_cost_and_usage. For deployments use list_cloudformation_stacks.\n\n"
-        "RULES:\n"
-        "- If you search for a resource and cannot find it, say so clearly. "
-        "Never substitute a different resource.\n"
-        "- For read operations, execute immediately. For write/delete operations, "
-        "describe and ask for confirmation.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the "
-        "previously proposed action.\n"
-        "- For cost queries, always show breakdown by service and time period."
+        "CodePipeline, SSM, Step Functions, CloudWatch, health events, Trusted Advisor, and "
+        "service quotas. For costs use get_cost_and_usage and break down by service and period."
     ),
-
     "deployment": (
         "You are an AWS Deployment specialist. You deploy code to Lambda, ECS/ECR, EC2 (via SSM), "
-        "App Runner, S3 static sites, and CloudFormation/SAM stacks.\n\n"
-        "WORKFLOW:\n"
-        "1. Use prepare_code_payload to extract/validate the code.\n"
-        "2. Use detect_code_language if the runtime is not explicit.\n"
-        "3. Use create_deployment_plan to present the plan to the operator.\n"
-        "4. WAIT for operator confirmation before executing any deployment.\n"
-        "5. Execute the appropriate deploy_* tool.\n"
-        "6. Return the deployment manifest with resource identifiers.\n\n"
-        "UPLOADED ZIP WORKFLOW (when an UPLOADED ARTIFACT note is present):\n"
-        "1. Call inspect_uploaded_artifact first.\n"
-        "2. Pick the target the operator asked for (lambda, ec2, ecs, s3 static site); "
-        "if they did not say, recommend one from recommended_targets and ask.\n"
-        "3. Present a plan via create_deployment_plan with account, region, resource name, "
-        "runtime/handler or run command, and any IAM roles or instances that will be created.\n"
-        "4. After confirmation call deploy_artifact_to_lambda, deploy_artifact_to_ec2 "
-        "(launch_ec2_for_artifact first if they have no instance), deploy_artifact_to_ecs, "
-        "or deploy_artifact_to_static_site with the artifact_uri.\n\n"
-        "RULES:\n"
-        "- NEVER deploy without presenting a plan and receiving confirmation.\n"
-        "- Always include the AWS account ID and region in the deployment plan.\n"
-        "- For updates to existing resources, mention what will change.\n"
-        "- For rollbacks, confirm which version/revision will be restored.\n"
-        "- If a deployment fails, return the error and suggest corrective actions.\n"
-        "- Respond in plain English with bullet points, not raw JSON.\n"
-        "- When the user says 'yes', 'go ahead', 'do it', 'confirm' -- execute the deployment."
+        "App Runner, S3 static sites, and CloudFormation/SAM stacks.\n"
+        "WORKFLOW: prepare/inspect the code (prepare_code_payload, detect_code_language, or "
+        "inspect_uploaded_artifact for an uploaded zip), present the plan with "
+        "create_deployment_plan, then call the deploy tool so it is queued for approval. For "
+        "updates say what will change; for rollbacks say which version will be restored.\n"
+        "UPLOADED ZIPS: use the deploy_artifact_* tools with the given artifact_uri. If the "
+        "operator wants EC2 but has no instance, queue launch_ec2_for_artifact first and tell "
+        "them to approve it, then ask them to request the deployment once the instance is "
+        "Online in SSM (check_ec2_ssm_status)."
     ),
 }
 
+DOMAIN_PROMPTS = {d: f"{intro}\n\n{COMMON_RULES}" for d, intro in DOMAIN_INTROS.items()}
+
 
 # ---------------------------------------------------------------------------
-# Domain tool groups (~30-50 tools each)
+# Domain tool groups (~30-60 tools each)
 # ---------------------------------------------------------------------------
 
 TOOLS_COMPUTE = [
@@ -488,6 +417,19 @@ DOMAIN_TOOLS = {
     "deployment": TOOLS_DEPLOYMENT,
 }
 
+# Every tool by name, for executing approved actions.
+TOOL_REGISTRY = {t.tool_name: t for group in DOMAIN_TOOLS.values() for t in group}
+
+router = DomainRouter(region=config.AWS_REGION)
+action_store = ActionStore()
+account_registry = AccountRegistry()
+
+_ACCOUNT_ID_RE = re.compile(r"\b(\d{12})\b")
+_MISSING_TOOL_PHRASES = (
+    "don't have a tool", "not available in the current tools", "cannot find a tool",
+    "i don't have the capability", "not covered by my tools", "no appropriate tool", "escalate",
+)
+
 
 # ---------------------------------------------------------------------------
 # AgentCore app
@@ -499,228 +441,188 @@ app = BedrockAgentCoreApp()
 @app.entrypoint
 def invoke(payload: dict) -> dict:
     """
-    Multi-agent entrypoint. Routes query to the correct specialist.
-
-    Accepts:
+    Request:
         {
-            "prompt": "list my EC2 instances",
-            "domain": "auto" | "compute" | "storage" | ... ,
-            "session_id": "customer-123",
-            "tenant_id": "tenant-456",
-            "history": [...]
-        }
-
-    Returns:
-        {
-            "response": "...",
-            "domain": "compute",
-            "session_id": "...",
-            "tools_available": 52,
-            "execution_time_ms": 1234.56
+          "mode": "chat" | "execute",
+          "session_id": "<conversation id>", "tenant_id": "...",
+          "user": {"id": "...", "email": "...", "role": "viewer|operator|sre|admin"},
+          # chat
+          "prompt": "<history + message>", "user_message": "<latest message>",
+          "history": [...], "account_ids": [...], "region": "...", "artifact": {...},
+          # execute
+          "action_ids": [...]
         }
     """
-    start_time = time.time()
+    caller = _caller(payload)
+    structlog.contextvars.bind_contextvars(
+        tenant_id=caller["tenant_id"], user_id=caller["user_id"],
+        session_id=payload.get("session_id", ""),
+    )
+    start = time.time()
+    mode = payload.get("mode", "chat")
+    try:
+        if mode == "execute":
+            result = _execute(payload, caller)
+        elif mode == "check_account":
+            result = _check_account(payload, caller)
+        elif mode == "chat":
+            result = _chat(payload, caller)
+        else:
+            result = {"response": f"Unknown mode '{mode}'.", "error": "BadRequest"}
+        ok = "error" not in result
+    except Exception as e:
+        logger.exception("invoke_failed")
+        result, ok = {"response": f"Agent error: {e}", "error": type(e).__name__}, False
+    duration_ms = (time.time() - start) * 1000
+    metrics.request(f"agent-{mode}", duration_ms, ok)
+    result["execution_time_ms"] = round(duration_ms, 2)
+    result["session_id"] = payload.get("session_id", "")
+    return result
 
+
+def _caller(payload: dict) -> dict:
+    user = payload.get("user") or {}
+    try:
+        role = UserRole(user.get("role", "viewer"))
+    except ValueError:
+        role = UserRole.VIEWER
+    return {
+        "user_id": str(user.get("id") or user.get("email") or "unknown"),
+        "role": role,
+        "tenant_id": str(payload.get("tenant_id") or config.DEFAULT_TENANT_ID),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
+
+def _chat(payload: dict, caller: dict) -> dict:
     prompt = payload.get("prompt", "")
-    domain = payload.get("domain", "auto")
-    session_id = payload.get("session_id", "default")
-    tenant_id = payload.get("tenant_id", "default")
     history = payload.get("history", [])
+    session_id = payload.get("session_id") or "default"
     region = payload.get("region") or None
-    context_notes = _build_context_notes(payload.get("artifact"), region)
+    artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else None
+    can_propose = Permission.PROPOSE_CHANGES in ROLE_PERMISSIONS[caller["role"]]
 
-    # Non-fatal telemetry
-    try:
-        tenant_manager.record_usage(tenant_id, "tool_executions")
-    except Exception:
-        pass
+    if not prompt.strip():
+        return {"response": "Empty prompt.", "error": "BadRequest"}
+    if not usage_meter.allow_request(caller["tenant_id"]):
+        return {"response": "Your organisation has reached today's request limit.",
+                "error": "RateLimited"}
 
-    try:
-        if not tenant_manager.check_usage_limits(tenant_id, "execute_tool"):
-            return {
-                "response": "Tool execution limit exceeded. Please upgrade your plan.",
-                "domain": domain,
-                "session_id": session_id,
-                "error": "RATE_LIMITED",
-            }
-    except Exception:
-        pass
+    targets, refused = _resolve_accounts(payload, prompt)
+    notes = _build_context_notes(artifact, region, read_only=not can_propose)
 
-    # Determine which account(s) this request should act on. Zero/one account
-    # behaves exactly like before; multiple accounts fan out.
-    target_accounts = _extract_target_accounts(payload, prompt)
-
-    try:
-        if len(target_accounts) <= 1:
-            # Single-account (or base-account) path.
-            account_id = target_accounts[0] if target_accounts else None
-            with use_account(account_id):
-                result_text, final_domains, tool_count = _resolve_query(
-                    prompt, domain, history, context_notes, bool(payload.get("artifact"))
+    per_account, queued, domains_seen, max_tools = [], [], set(), 0
+    for account_id in refused:
+        per_account.append({
+            "account_id": account_id, "domain": "none", "error": "AccountNotRegistered",
+            "response": (f"Account {account_id} is not registered. An admin can add it on the "
+                         f"Accounts page after deploying the cross-account role there."),
+        })
+    for account_id in targets:
+        gate = ApprovalGate(action_store, tenant_id=caller["tenant_id"], session_id=session_id,
+                            requested_by=caller["user_id"], account_id=account_id, region=region)
+        try:
+            with use_account(account_id, region):
+                text, domains, tools = _resolve_query(
+                    prompt, payload.get("domain", "auto"), history, notes, gate,
+                    has_artifact=bool(artifact), read_only=not can_propose,
                 )
+            per_account.append({"account_id": account_id, "response": text,
+                                "domain": "+".join(domains)})
+            domains_seen.update(domains)
+            max_tools = max(max_tools, tools)
+        except Exception as e:  # one account failing shouldn't abort the rest
+            logger.exception("account_run_failed", account_id=account_id)
+            per_account.append({"account_id": account_id, "response": f"Account error: {e}",
+                                "domain": "unknown", "error": type(e).__name__})
+        queued.extend(gate.queued)
 
-            duration_ms = (time.time() - start_time) * 1000
-            domain_str = "+".join(final_domains)
-
-            try:
-                monitoring_manager.record_tool_execution(
-                    tool_name="agent_invocation",
-                    duration_ms=duration_ms,
-                    success=True,
-                    tenant_id=tenant_id,
-                )
-            except Exception:
-                pass
-
-            resp = {
-                "response": result_text,
-                "domain": domain_str,
-                "session_id": session_id,
-                "tenant_id": tenant_id,
-                "execution_time_ms": round(duration_ms, 2),
-                "tools_available": tool_count,
-            }
-            if account_id:
-                resp["accounts"] = [account_id]
-            return resp
-
-        # --- Multi-account fan-out ---
-        # Run the same query against every specified account, each under its own
-        # assumed-role credentials, and aggregate the results into one report.
-        per_account = []
-        domains_seen = set()
-        max_tools = 0
-        for account_id in target_accounts:
-            try:
-                with use_account(account_id):
-                    a_text, a_domains, a_tools = _resolve_query(
-                        prompt, domain, history, context_notes, bool(payload.get("artifact"))
-                    )
-                domains_seen.update(a_domains)
-                max_tools = max(max_tools, a_tools)
-                per_account.append({
-                    "account_id": account_id,
-                    "response": a_text,
-                    "domain": "+".join(a_domains),
-                })
-            except Exception as acc_err:  # one account failing shouldn't abort the rest
-                per_account.append({
-                    "account_id": account_id,
-                    "response": f"Account error: {str(acc_err)}",
-                    "domain": "unknown",
-                    "error": type(acc_err).__name__,
-                })
-
-        combined = "\n\n".join(
-            f"=== Account {r['account_id']} ===\n{r['response']}" for r in per_account
+    if len(per_account) == 1:
+        response = per_account[0]["response"]
+    else:
+        response = "\n\n".join(
+            f"=== Account {r['account_id'] or 'platform'} ===\n{r['response']}" for r in per_account
         )
 
-        duration_ms = (time.time() - start_time) * 1000
+    for action in queued:
+        security_manager.log_audit_event(
+            caller["user_id"], caller["tenant_id"], "action_proposed", action["summary"], "PENDING",
+            details={"action_id": action["action_id"], "account_id": action["account_id"],
+                     "region": action["region"]},
+        )
 
-        try:
-            monitoring_manager.record_tool_execution(
-                tool_name="agent_invocation",
-                duration_ms=duration_ms,
-                success=True,
-                tenant_id=tenant_id,
-            )
-        except Exception:
-            pass
-
-        return {
-            "response": combined,
-            "domain": "+".join(sorted(domains_seen)) if domains_seen else "unknown",
-            "session_id": session_id,
-            "tenant_id": tenant_id,
-            "execution_time_ms": round(duration_ms, 2),
-            "tools_available": max_tools,
-            "accounts": target_accounts,
-            "per_account": per_account,
-        }
-
-    except Exception as e:
-        duration_ms = (time.time() - start_time) * 1000
-
-        # Non-fatal monitoring
-        try:
-            monitoring_manager.record_tool_execution(
-                tool_name="agent_invocation",
-                duration_ms=duration_ms,
-                success=False,
-                tenant_id=tenant_id,
-                error_type=type(e).__name__,
-            )
-        except Exception:
-            pass
-
-        return {
-            "response": f"Agent error: {str(e)}",
-            "domain": "unknown",
-            "session_id": session_id,
-            "error": type(e).__name__,
-            "execution_time_ms": round(duration_ms, 2),
-        }
+    explicit_accounts = [a for a in targets if a] + refused
+    return {
+        "response": response,
+        "domain": "+".join(sorted(domains_seen)) or "unknown",
+        "tools_available": max_tools,
+        "accounts": explicit_accounts,
+        "per_account": per_account if len(per_account) > 1 else [],
+        "pending_actions": queued,
+        "escalate": "ESCALATE" in response.upper() and not queued,
+    }
 
 
-_ACCOUNT_ID_RE = re.compile(r"\b(\d{12})\b")
-
-
-def _extract_target_accounts(payload: dict, prompt: str) -> list:
+def _resolve_accounts(payload: dict, prompt: str):
     """
-    Determine which AWS account(s) the request targets.
+    Return (targets, refused). ``targets`` holds account ids to act on, with None
+    meaning the platform's own account; ``refused`` holds requested ids that are
+    not registered.
 
-    Precedence:
-      1. Explicit payload fields: "accounts" / "account_ids" (list) or
-         "account_id" / "account" (single). If any of these keys is present the
-         caller has chosen explicitly, and an empty value means the base account.
-      2. 12-digit account numbers mentioned in the latest user message
-         ("user_message", falling back to the prompt). Conversation history is
-         not scanned, so ARNs echoed in earlier replies never trigger a fan-out.
-      3. Empty list -> act on the runtime's own (base) account.
-
-    Returns a de-duplicated, order-preserving list of 12-digit account id strings.
+    Precedence: explicit "account_ids"/"accounts"/"account_id"/"account" payload
+    keys (an empty list means the platform account); otherwise 12-digit ids in
+    the latest user message. Conversation history is never scanned.
     """
     raw = []
-    explicit = any(
-        key in payload for key in ("accounts", "account_ids", "account_id", "account")
-    )
-
+    explicit = any(k in payload for k in ("accounts", "account_ids", "account_id", "account"))
     for key in ("accounts", "account_ids"):
         val = payload.get(key)
         if isinstance(val, (list, tuple)):
             raw.extend(str(a).strip() for a in val)
         elif isinstance(val, str):
-            raw.extend(p.strip() for p in re.split(r"[,\s]+", val) if p.strip())
-
+            raw.extend(p for p in re.split(r"[,\s]+", val) if p)
     for key in ("account_id", "account"):
         val = payload.get(key)
         if isinstance(val, str) and val.strip():
             raw.append(val.strip())
-
-    # Fall back to account numbers named in the latest message itself.
     if not explicit:
-        message = payload.get("user_message") or prompt or ""
-        raw.extend(_ACCOUNT_ID_RE.findall(message))
+        raw.extend(_ACCOUNT_ID_RE.findall(payload.get("user_message") or prompt or ""))
 
-    # Keep only valid 12-digit ids, de-duplicated, order preserved.
-    seen = set()
-    accounts = []
-    for a in raw:
-        if _ACCOUNT_ID_RE.fullmatch(a) and a not in seen:
-            seen.add(a)
-            accounts.append(a)
-    return accounts
+    requested = list(dict.fromkeys(a for a in raw if _ACCOUNT_ID_RE.fullmatch(a)))
+    if not requested:
+        return [None], []
+
+    base = base_account_id()
+    allowed = set(account_registry.list())
+    targets, refused = [], []
+    for account_id in requested:
+        if account_id == base:
+            targets.append(None)
+        elif account_id in allowed:
+            targets.append(account_id)
+        else:
+            refused.append(account_id)
+    return list(dict.fromkeys(targets)), refused
 
 
-def _build_context_notes(artifact, region) -> list:
-    """System-prompt notes describing the operator's upload and chosen region."""
+def _build_context_notes(artifact, region, read_only: bool = False) -> list:
+    """System-prompt notes describing the operator's upload, region and permissions."""
     notes = []
+    if read_only:
+        notes.append(
+            "READ-ONLY SESSION: The operator's role cannot change resources and no mutating "
+            "tools are loaded. Investigate and explain; if they ask for a change, describe what "
+            "would be needed and say that an operator, SRE or admin must request it."
+        )
     if region:
         notes.append(
             f"REGION CONTEXT: The operator selected region {region}. Pass region='{region}' "
             f"to every tool that takes a region unless the operator names another one."
         )
-    if isinstance(artifact, dict) and artifact.get("uri"):
+    if artifact and artifact.get("uri"):
         lines = [
             "UPLOADED ARTIFACT: The operator uploaded a code zip for deployment.",
             f"- artifact_uri: {artifact['uri']}",
@@ -733,25 +635,21 @@ def _build_context_notes(artifact, region) -> list:
         if artifact.get("options"):
             lines.append(f"- operator options: {json.dumps(artifact['options'])}")
         lines.append(
-            "Use inspect_uploaded_artifact, then present a deployment plan and wait for "
-            "confirmation before calling any deploy_artifact_* tool. Never invent a different URI."
+            "Call inspect_uploaded_artifact first, then present the plan and call the matching "
+            "deploy_artifact_* tool so it is queued for approval. Never use a different URI."
         )
         notes.append("\n".join(lines))
     return notes
 
 
-def _resolve_query(prompt: str, domain: str, history: list,
-                   context_notes: list = None, has_artifact: bool = False):
+def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
+                   gate: ApprovalGate, has_artifact: bool = False, read_only: bool = False):
     """
-    Route the prompt to 1-2 domains, run the agent, and auto-retry with an
-    expanded domain set if the agent signals it lacked the right tool.
-
-    Runs under whatever account context is currently active (see aws_clients),
-    so it works for both the base account and any assumed cross-account role.
+    Route the prompt to 1-2 domains, run the agent, and retry once with an extra
+    domain if the agent signals it lacked the right tool.
 
     Returns (response_text, domains_used, tool_count).
     """
-    # Route to correct domain(s) - supports cross-service queries (1-2 domains)
     if domain == "auto" or domain not in DOMAIN_TOOLS:
         domains = router.route(prompt, history)
     else:
@@ -761,90 +659,128 @@ def _resolve_query(prompt: str, domain: str, history: list,
     if has_artifact and "deployment" not in domains:
         domains = domains[:1] + ["deployment"]
 
-    result_text, final_domains, tool_count = _run_agent_with_domains(
-        prompt, domains, history, context_notes
+    text, final_domains, tool_count = _run_agent_with_domains(
+        prompt, domains, context_notes, gate, read_only
     )
 
-    # Auto-retry if agent indicates missing tools
-    needs_retry = any(phrase in result_text.lower() for phrase in [
-        "don't have a tool",
-        "not available in the current tools",
-        "cannot find a tool",
-        "i don't have the capability",
-        "not covered by my tools",
-        "no appropriate tool",
-        "escalate",
-    ])
-
-    if needs_retry and len(final_domains) < 3:
+    needs_retry = any(p in text.lower() for p in _MISSING_TOOL_PHRASES)
+    if needs_retry and not gate.queued and len(final_domains) < 3:
         tried = set(final_domains)
-        remaining = [d for d in DOMAIN_TOOLS.keys() if d not in tried]
-        if remaining:
-            retry_prompt = (
-                f"The query '{prompt}' could not be handled by {'+'.join(tried)} tools. "
-                f"Which additional domain is needed? Options: {' '.join(remaining)}"
+        remaining = [d for d in DOMAIN_TOOLS if d not in tried]
+        retry_prompt = (
+            f"The query '{prompt[-1500:]}' could not be handled by {'+'.join(tried)} tools. "
+            f"Which additional domain is needed? Options: {' '.join(remaining)}"
+        )
+        extra = [d for d in router.route(retry_prompt) if d not in tried]
+        if extra:
+            text, final_domains, tool_count = _run_agent_with_domains(
+                prompt, final_domains + extra[:1], context_notes, gate, read_only
             )
-            extra_domains = router.route(retry_prompt)
-            new_domains_to_add = [d for d in extra_domains if d not in tried]
-            if new_domains_to_add:
-                expanded = final_domains + new_domains_to_add[:1]  # max 3 total
-                result_text, final_domains, tool_count = _run_agent_with_domains(
-                    prompt, expanded, history, context_notes
-                )
-
-    return result_text, final_domains, tool_count
+    return text, final_domains, tool_count
 
 
-def _run_agent_with_domains(prompt: str, domains: list, history: list = None,
-                            context_notes: list = None):
-    """
-    Create and run an agent with merged tools from the specified domains.
-    Returns (response_text, domains_used, tool_count).
-    """
-    # Merge tools from all selected domains (deduplicated)
-    seen_ids = set()
-    tools = []
+def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
+                            gate: ApprovalGate, read_only: bool = False):
+    """Run one agent over the merged tools of ``domains``. Returns (text, domains, tool_count)."""
+    seen, tools = set(), []
     for d in domains:
         for tool_fn in DOMAIN_TOOLS.get(d, []):
-            if id(tool_fn) not in seen_ids:
-                seen_ids.add(id(tool_fn))
-                tools.append(tool_fn)
+            if id(tool_fn) in seen or (read_only and is_mutating(tool_fn.tool_name)):
+                continue
+            seen.add(id(tool_fn))
+            tools.append(tool_fn)
 
-    # Build system prompt - primary domain's prompt + cross-domain note
-    primary_domain = domains[0]
-    system_prompt = DOMAIN_PROMPTS[primary_domain]
-
+    system_prompt = DOMAIN_PROMPTS[domains[0]]
     if len(domains) > 1:
-        others = ", ".join(domains[1:])
         system_prompt += (
-            f"\n\nCross-service context: This query involves multiple domains. "
-            f"You have tools from {primary_domain} AND {others} loaded. "
+            f"\n\nCross-service context: tools from {', '.join(domains)} are loaded. "
             f"Use tools from any loaded domain as needed."
         )
 
-    # Tell the agent which account it is operating on, so it reports accurately.
-    active_account = get_active_account()
-    if active_account:
+    active = get_active_account()
+    if active:
+        name = account_registry.name_of(active)
+        label = f"{active} ({name})" if name and name != active else active
         system_prompt += (
-            f"\n\nACCOUNT CONTEXT: All tool calls in this turn run against AWS account "
-            f"{active_account} (via an assumed cross-account role). State this account id "
-            f"when you report results, and do not claim to act on any other account."
+            f"\n\nACCOUNT CONTEXT: All tool calls in this turn run against AWS account {label} "
+            f"via an assumed cross-account role. State this account when you report, and do not "
+            f"claim to act on any other account."
+        )
+    else:
+        system_prompt += (
+            "\n\nACCOUNT CONTEXT: Tool calls run against the platform's own AWS account."
         )
 
-    for note in context_notes or []:
+    for note in context_notes:
         system_prompt += f"\n\n{note}"
-
-    # Add universal safety rules
     system_prompt += (
-        "\n\nIMPORTANT: If you truly cannot find a matching tool for what the user needs, "
-        "respond with exactly: ESCALATE - [brief reason why]"
+        "\n\nIf you truly cannot find a matching tool for what the operator needs, respond with "
+        "exactly: ESCALATE - [brief reason why]"
     )
 
-    # Create and run agent
-    agent = Agent(model=_AGENT_MODEL, system_prompt=system_prompt, tools=tools)
-    response = agent(prompt)
+    agent = Agent(model=_AGENT_MODEL, system_prompt=system_prompt, tools=tools,
+                  hooks=[gate], callback_handler=None)
+    return str(agent(prompt)), domains, len(tools)
 
-    return str(response), domains, len(tools)
+
+# ---------------------------------------------------------------------------
+# Execute approved actions
+# ---------------------------------------------------------------------------
+
+def _execute(payload: dict, caller: dict) -> dict:
+    action_ids = [str(a) for a in payload.get("action_ids") or []][:20]
+    if not action_ids:
+        return {"response": "No actions given.", "error": "BadRequest"}
+
+    def audit(**kwargs):
+        security_manager.log_audit_event(caller["user_id"], caller["tenant_id"], **kwargs)
+
+    results = execute_actions(
+        action_ids, tenant_id=caller["tenant_id"], approver=caller["user_id"],
+        approver_role=caller["role"].value, tools=TOOL_REGISTRY, store=action_store, audit=audit,
+    )
+    lines = []
+    for r in results:
+        metrics.action(r["status"])
+        icon = {"succeeded": "✅", "failed": "❌"}.get(r["status"], "⚠️")
+        where = f" in {r['account_id']}" if r.get("account_id") else ""
+        detail = r.get("error") or _result_headline(r.get("result"))
+        lines.append(f"{icon} {r.get('summary', r['action_id'])}{where}: {r['status']}"
+                     + (f" — {detail}" if detail else ""))
+    return {"response": "\n".join(lines), "results": results}
+
+
+def _check_account(payload: dict, caller: dict) -> dict:
+    """Admin check that the cross-account role in an account can be assumed."""
+    if Permission.MANAGE_ACCOUNTS not in ROLE_PERMISSIONS[caller["role"]]:
+        return {"ok": False, "response": "Only admins can test accounts.", "error": "Forbidden"}
+    account_id = str(payload.get("account_id", ""))
+    if not _ACCOUNT_ID_RE.fullmatch(account_id):
+        return {"ok": False, "response": "Invalid account id.", "error": "BadRequest"}
+    try:
+        with use_account(account_id):
+            arn = boto3.client("sts").get_caller_identity()["Arn"]
+        return {"ok": True, "response": f"Connected to {account_id} as {arn}."}
+    except Exception as e:
+        return {"ok": False, "response": f"Cannot assume {config.CROSS_ACCOUNT_ROLE_NAME} in "
+                                         f"{account_id}: {e}"}
+
+
+def _result_headline(result) -> str:
+    """One-line summary of a tool result (deployment manifests and error JSON)."""
+    if not result:
+        return ""
+    try:
+        data = json.loads(result)
+    except (TypeError, ValueError):
+        return str(result)[:300]
+    if not isinstance(data, dict):
+        return str(result)[:300]
+    if data.get("error_message"):
+        return data["error_message"][:300]
+    if data.get("resource_arn"):
+        return data["resource_arn"]
+    return str(data.get("message") or "")[:300]
 
 
 if __name__ == "__main__":

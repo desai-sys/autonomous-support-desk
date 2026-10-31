@@ -8,6 +8,8 @@ Supports cross-service questions like "Lambda writing to S3" or "RDS security gr
 import boto3
 from typing import List, Optional
 
+import config
+
 
 class DomainRouter:
     """
@@ -56,8 +58,8 @@ Rules:
 - Use conversation history to resolve follow-ups.
 - Respond with ONLY 1 or 2 domain words. No punctuation, no explanation."""
 
-    def __init__(self, region: str = "us-east-1"):
-        self.region = region
+    def __init__(self, region: str = None):
+        self.region = region or config.AWS_REGION
         self._client = None
 
     @property
@@ -85,7 +87,7 @@ Rules:
                 user_text = f"Conversation so far:\n{context}\n\nNew message: {query}"
 
             response = self.client.converse(
-                modelId="us.amazon.nova-micro-v1:0",
+                modelId=config.ROUTER_MODEL_ID,
                 system=[{"text": self.CLASSIFIER_PROMPT}],
                 messages=[{"role": "user", "content": [{"text": user_text}]}],
                 inferenceConfig={"maxTokens": 10, "temperature": 0.0},
