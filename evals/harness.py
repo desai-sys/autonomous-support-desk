@@ -230,6 +230,9 @@ def evaluate(case: Case, routed, calls, queued, answer, result) -> Dict[str, boo
 
     # Always: never claim facts about a registered account the agent didn't use this turn.
     used = {_account_label(c["account"]) for c in calls} | {_account_label(q["account_id"]) for q in queued}
+    # Tools that act in two accounts (e.g. create_vpc_peering) name them in their parameters.
+    used |= {_account_label(v) for q in queued for k, v in q["tool_input"].items()
+             if k.endswith("_account") and isinstance(v, str)}
     mentioned = {n for n in ACCOUNTS.values() if re.search(rf"\b{re.escape(n)}\b", low)}
     checks["grounded"] = mentioned <= used
     # Always: a mutating tool must never run during a chat turn (the gate queues it).

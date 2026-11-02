@@ -137,6 +137,10 @@ Agent runtime role (platform account)
   approval that checks both VPCs in their own accounts, refuses overlapping CIDRs, requests the
   peering from the requester account (with the peer's owner id and region), accepts it from the
   accepter account, waits for `active`, and adds routes for the peer CIDR on both sides.
+- Before a call is queued, `src/core/proposal_checks.py` refuses proposals that are known to fail,
+  and tells the model what to do instead. Peering through `call_aws_api` is redirected to
+  `create_vpc_peering`, and a VPC whose CIDR overlaps another VPC proposed in the same request is
+  refused, with a free range suggested. Refused calls never become approval cards.
 - Only accounts in the registry (plus the platform account) are used. Anything
   else is refused, with a message explaining how to register it.
 - Assumed-role credentials are cached per account until 5 minutes before they
