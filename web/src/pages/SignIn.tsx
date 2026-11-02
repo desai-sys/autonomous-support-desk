@@ -37,7 +37,7 @@ export function SignIn({ mode, onSignedIn }: { mode: "oidc" | "local"; onSignedI
           </p>
           <ul className="mt-8 space-y-3 text-sm">
             {[
-              [Zap, "285 AWS tools across compute, network, data, security and cost"],
+              [Zap, "289 AWS tools across compute, network, data, security and cost"],
               [ShieldCheck, "Every change waits for your one-click approval"],
               [Sparkles, "Describe an app — it writes the code and ships it"],
             ].map(([Icon, text], i) => {

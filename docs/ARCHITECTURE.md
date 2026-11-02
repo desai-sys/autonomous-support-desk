@@ -13,7 +13,7 @@ it with `python docs/architecture.py`, which needs Graphviz.
 | Gateway | Inside the console process | `src/agents/gateway.py` | Calls the agent (`InvokeAgentRuntime`); falls back to the knowledge base when the agent escalates; rejects actions and lists pending ones |
 | Agent | Bedrock AgentCore Runtime (Python 3.12, code deployment) | `agent_main.py`, `src/agentcore_entrypoint.py` | Routes each prompt to 1–2 tool domains, runs a Strands agent per target account, queues changes, and executes approved ones |
 | Domain router | Inside the agent | `src/agents/router.py` | One Nova Micro call classifies the prompt into domains (compute, storage, network, database, security, ops, deployment) |
-| Tools | Inside the agent | `src/tools/` | 285 boto3 tools; their clients are account-aware through `src/core/aws_clients.py`. Every domain also has `query_aws_api` (any read-only AWS operation, secret-returning calls blocked) and `call_aws_api` (any other AWS operation, always approval-gated), so the agent is never stuck for lack of a purpose-built tool |
+| Tools | Inside the agent | `src/tools/` | 289 boto3 tools; their clients are account-aware through `src/core/aws_clients.py`. Every domain also has `list_aws_operations` and `describe_aws_operation` (exact current operation names and parameters, read from the installed SDK's API definitions, so the model doesn't rely on possibly outdated memory), `query_aws_api` (any read-only AWS operation, secret-returning calls blocked) and `call_aws_api` (any other AWS operation, always approval-gated), so the agent is never stuck for lack of a purpose-built tool |
 | Approval engine | Inside the agent | `src/core/approvals.py` | Intercepts mutating tool calls, stores them, and executes approved ones exactly once |
 | Account registry | DynamoDB `accounts` | `src/core/accounts.py` | Allow-list of accounts the agent may assume roles in |
 | Learning loop | Scheduled ECS task (hourly) | `src/jobs/learning_loop.py` | Writes resolved tickets, with tenant metadata, to the knowledge bucket and starts ingestion |
@@ -182,4 +182,5 @@ console vouches for `user` from the signed Cognito session.
 | CloudFront in front of a CloudFront-only ALB | HTTPS without owning a domain, WAF, and an origin protected by both prefix list and secret header |
 | Metrics as CloudWatch EMF log lines | No extra API calls on the request path |
 | Approval gate as a Strands hook | Enforced in code for every tool, whatever the prompt says |
+| API knowledge from the SDK's bundled models, refreshed weekly | The model looks up parameters instead of guessing; a weekly workflow bumps boto3/botocore, relocks and tests, so new AWS APIs arrive without manual work |
 | Learning loop as a scheduled ECS task reusing the console image | No extra package to build |

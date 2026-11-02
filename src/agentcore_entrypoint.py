@@ -183,7 +183,9 @@ from src.tools.app_builder_tools import (
     delete_generated_app, deploy_generated_app, get_generated_app, prepare_app_bundle,
     prepare_app_file, prepare_app_template,
 )
-from src.tools.aws_api_tools import call_aws_api, query_aws_api
+from src.tools.aws_api_tools import (
+    call_aws_api, describe_aws_operation, list_aws_operations, query_aws_api,
+)
 
 from src.tools.artifact_tools import (
     inspect_uploaded_artifact,
@@ -203,7 +205,9 @@ COMMON_RULES = (
     "RULES:\n"
     "- You CAN act on AWS: never tell the operator to do it themselves in the console. If a "
     "purpose-built tool fits, use it; otherwise use query_aws_api (read-only operations) or "
-    "call_aws_api (any change) with the exact boto3 service, operation and parameters.\n"
+    "call_aws_api (any change) with the exact boto3 service, operation and parameters. Your "
+    "memory of AWS APIs may be out of date: unless you are certain, first find the operation with "
+    "list_aws_operations and read its current parameters with describe_aws_operation.\n"
     "- If a change needs details the operator hasn't given, ask for them in ONE short message "
     "and propose sensible defaults (e.g. instance type t3.micro, Amazon Linux 2023, default VPC), "
     "so they can just reply 'yes' or adjust. Look up what you can yourself (VPCs, subnets, key "
@@ -464,13 +468,13 @@ TOOLS_COMPUTE.append(launch_ec2_instance)
 TOOLS_DEPLOYMENT.append(launch_ec2_instance)
 for _group in (TOOLS_COMPUTE, TOOLS_STORAGE, TOOLS_NETWORK, TOOLS_DATABASE,
                TOOLS_SECURITY, TOOLS_COST_OPS, TOOLS_DEPLOYMENT):
-    _group.extend([query_aws_api, call_aws_api])
+    _group.extend([list_aws_operations, describe_aws_operation, query_aws_api, call_aws_api])
 
 
 TOOLS_BUILD = [
     prepare_app_file, prepare_app_template, prepare_app_bundle, get_generated_app,
     deploy_generated_app, delete_generated_app,
-    validate_cfn_template, query_aws_api, call_aws_api,
+    validate_cfn_template, list_aws_operations, describe_aws_operation, query_aws_api, call_aws_api,
     search_resource_by_name, describe_agent_capabilities,
 ]
 
