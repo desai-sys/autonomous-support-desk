@@ -648,105 +648,149 @@ def list_efs_filesystems(region: str = 'us-east-1') -> str:
 # S3 Security — bulk public access check
 # ============================================================================
 
+_BLOCK_FLAGS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+_PUBLIC_GROUPS = ("AllUsers", "AuthenticatedUsers")
+
+
+def _error_code(e: Exception) -> str:
+    return str(getattr(e, "response", {}).get("Error", {}).get("Code", type(e).__name__))
+
+
+def _account_public_access_block():
+    """(config dict, error) for the account-wide S3 Block Public Access setting."""
+    try:
+        account_id = boto3.client("sts").get_caller_identity()["Account"]
+        cfg = boto3.client("s3control", region_name="us-east-1").get_public_access_block(
+            AccountId=account_id)["PublicAccessBlockConfiguration"]
+        return cfg, None
+    except Exception as e:
+        if _error_code(e) == "NoSuchPublicAccessBlockConfiguration":
+            return {}, None
+        return None, f"account public access block unreadable ({_error_code(e)})"
+
+
+def _bucket_region(s3, name: str) -> str:
+    try:
+        loc = s3.get_bucket_location(Bucket=name).get("LocationConstraint")
+        return {None: "us-east-1", "": "us-east-1", "EU": "eu-west-1"}.get(loc, loc)
+    except Exception:
+        return "us-east-1"
+
+
+def _bucket_exposure(name: str, account_block, account_error) -> dict:
+    """
+    Decide whether one bucket is publicly accessible, following S3's rules:
+    a public bucket policy (S3's own IsPublic verdict) counts unless
+    RestrictPublicBuckets is in effect; a public ACL grant counts unless
+    IgnorePublicAcls is in effect; each flag is in effect if set at the account
+    OR the bucket level. Returns public True/False, or None when a needed check failed.
+    """
+    region = _bucket_region(boto3.client("s3", region_name="us-east-1"), name)
+    s3 = boto3.client("s3", region_name=region)
+    result = {"bucket": name, "region": region, "public": None, "reasons": [], "errors": []}
+    if account_error:
+        result["errors"].append(account_error)
+
+    try:
+        bucket_block = s3.get_public_access_block(Bucket=name)["PublicAccessBlockConfiguration"]
+    except Exception as e:
+        if _error_code(e) == "NoSuchPublicAccessBlockConfiguration":
+            bucket_block = {}
+        else:
+            bucket_block = None
+            result["errors"].append(f"bucket public access block unreadable ({_error_code(e)})")
+    effective = {
+        flag: bool((account_block or {}).get(flag)) or bool((bucket_block or {}).get(flag))
+        for flag in _BLOCK_FLAGS
+    }
+    result["block_public_access"] = {
+        "account": account_block if account_block is not None else "unknown",
+        "bucket": bucket_block if bucket_block is not None else "unknown",
+        "effective": effective,
+    }
+
+    policy_public = None
+    try:
+        policy_public = bool(s3.get_bucket_policy_status(Bucket=name)["PolicyStatus"].get("IsPublic"))
+    except Exception as e:
+        if _error_code(e) == "NoSuchBucketPolicy":
+            policy_public = False
+        else:
+            result["errors"].append(f"bucket policy status unreadable ({_error_code(e)})")
+
+    acl_public = None
+    try:
+        grants = s3.get_bucket_acl(Bucket=name).get("Grants", [])
+        public_grants = [g for g in grants
+                         if any(grp in g.get("Grantee", {}).get("URI", "") for grp in _PUBLIC_GROUPS)]
+        acl_public = bool(public_grants)
+        for g in public_grants:
+            result["reasons"].append(
+                f"ACL grants {g.get('Permission')} to {g['Grantee']['URI'].rsplit('/', 1)[-1]}"
+                + (" (ignored: IgnorePublicAcls is on)" if effective["IgnorePublicAcls"] else ""))
+    except Exception as e:
+        result["errors"].append(f"bucket ACL unreadable ({_error_code(e)})")
+
+    if policy_public:
+        result["reasons"].append("bucket policy is public"
+                                 + (" (restricted: RestrictPublicBuckets is on)"
+                                    if effective["RestrictPublicBuckets"] else ""))
+
+    exposed_by_policy = policy_public and not effective["RestrictPublicBuckets"]
+    exposed_by_acl = acl_public and not effective["IgnorePublicAcls"]
+    if exposed_by_policy or exposed_by_acl:
+        result["public"] = True
+    elif all(effective.values()):
+        result["public"] = False      # everything is blocked, whatever the policy or ACL say
+    elif policy_public is not None and acl_public is not None:
+        result["public"] = False
+    return result
+
+
 @tool
 def list_public_s3_buckets() -> str:
     """
-    Scan ALL S3 buckets and return only those that are potentially publicly accessible.
-    Checks: public access block settings, bucket ACL, and bucket policy.
-    Much faster than calling analyze_s3_bucket on each bucket individually.
+    Scan ALL S3 buckets in the account and report which are publicly accessible.
+
+    Uses S3's own rules: account- and bucket-level Block Public Access, S3's
+    public-policy verdict (GetBucketPolicyStatus) and public ACL grants. Each bucket
+    is reported as public, not public, or could-not-check (with the reason).
     """
     try:
-        s3 = boto3.client('s3', region_name='us-east-1')
-        all_buckets = s3.list_buckets().get('Buckets', [])
-
-        if not all_buckets:
-            return "No S3 buckets found in this account."
-
-        public_buckets = []
-        errors = []
-
-        for bucket in all_buckets:
-            name = bucket['Name']
-            reasons = []
-
-            # 1. Check public access block — the primary guard
-            try:
-                pab = s3.get_public_access_block(Bucket=name)
-                cfg = pab['PublicAccessBlockConfiguration']
-                fully_blocked = (
-                    cfg.get('BlockPublicAcls', False) and
-                    cfg.get('IgnorePublicAcls', False) and
-                    cfg.get('BlockPublicPolicy', False) and
-                    cfg.get('RestrictPublicBuckets', False)
-                )
-                if fully_blocked:
-                    continue  # All public access blocked — skip
-                if not cfg.get('BlockPublicAcls', False):
-                    reasons.append('BlockPublicAcls=OFF')
-                if not cfg.get('BlockPublicPolicy', False):
-                    reasons.append('BlockPublicPolicy=OFF')
-            except s3.exceptions.NoSuchPublicAccessBlockConfiguration:
-                reasons.append('no public access block configured')
-            except Exception:
-                # Access denied or other error — flag as unknown
-                reasons.append('public access block unreadable')
-
-            # 2. Check bucket ACL for public grants
-            try:
-                acl = s3.get_bucket_acl(Bucket=name)
-                for grant in acl.get('Grants', []):
-                    grantee = grant.get('Grantee', {})
-                    uri = grantee.get('URI', '')
-                    if 'AllUsers' in uri or 'AuthenticatedUsers' in uri:
-                        reasons.append(f"ACL grants {grant.get('Permission')} to {uri.split('/')[-1]}")
-            except Exception:
-                pass  # Access denied — skip ACL check
-
-            # 3. Check bucket policy for public statements
-            try:
-                policy_str = s3.get_bucket_policy(Bucket=name).get('Policy', '{}')
-                policy = json.loads(policy_str)
-                for stmt in policy.get('Statement', []):
-                    principal = stmt.get('Principal', '')
-                    effect = stmt.get('Effect', '')
-                    if effect == 'Allow' and (principal == '*' or principal == {'AWS': '*'}):
-                        actions = stmt.get('Action', [])
-                        if isinstance(actions, str):
-                            actions = [actions]
-                        public_actions = [a for a in actions if 's3:Get' in a or 's3:List' in a or a == 's3:*']
-                        if public_actions:
-                            reasons.append(f"bucket policy allows {public_actions} to *")
-            except s3.exceptions.NoSuchBucketPolicy:
-                pass
-            except Exception:
-                pass
-
-            if reasons:
-                public_buckets.append({
-                    'bucket': name,
-                    'reasons': reasons,
-                    'created': bucket['CreationDate'].isoformat()[:10],
-                })
-
-        if not public_buckets:
-            return (f"✅ All {len(all_buckets)} S3 buckets have public access blocked. "
-                    f"No publicly accessible buckets found.")
-
-        lines = [
-            f"⚠️  Found {len(public_buckets)} potentially public bucket(s) "
-            f"out of {len(all_buckets)} total:\n"
-        ]
-        for b in public_buckets:
-            lines.append(f"  {b['bucket']}")
-            for r in b['reasons']:
-                lines.append(f"    → {r}")
-        lines.append(
-            f"\nTo secure a bucket, ask me to 'enable public access block on <bucket-name>'."
-        )
-        return '\n'.join(lines)
-
+        buckets = boto3.client("s3", region_name="us-east-1").list_buckets().get("Buckets", [])
     except Exception as e:
-        return f"Error scanning S3 buckets for public access: {str(e)}"
+        return json.dumps({"status": "failed", "error": f"Could not list buckets ({_error_code(e)}): {e}"})
+    if not buckets:
+        return json.dumps({"status": "success", "total_buckets": 0, "public_buckets": [],
+                           "summary": "No S3 buckets in this account."})
+
+    account_block, account_error = _account_public_access_block()
+    results = [_bucket_exposure(b["Name"], account_block, account_error) for b in buckets]
+    public = [r for r in results if r["public"] is True]
+    unknown = [r for r in results if r["public"] is None]
+    not_public = len(results) - len(public) - len(unknown)
+    account_fully_blocked = bool(account_block) and all(account_block.get(f) for f in _BLOCK_FLAGS)
+
+    if unknown:
+        summary = (f"Scan INCOMPLETE: {len(public)} public, {not_public} not public, {len(unknown)} could "
+                   f"not be checked. Do not report the unchecked buckets as private; give the reasons.")
+    elif public:
+        summary = f"{len(public)} of {len(results)} buckets are publicly accessible."
+    else:
+        summary = f"None of the {len(results)} buckets are publicly accessible."
+
+    return json.dumps({
+        "status": "incomplete" if unknown else "success",
+        "summary": summary,
+        "total_buckets": len(results),
+        "account_block_public_access": ("all four settings on" if account_fully_blocked
+                                        else account_block if account_block is not None else "unknown"),
+        "public_buckets": [{"bucket": r["bucket"], "region": r["region"], "reasons": r["reasons"]}
+                           for r in public],
+        "unchecked_buckets": [{"bucket": r["bucket"], "errors": r["errors"]} for r in unknown],
+        "not_public_count": not_public,
+        "remediation": "Ask to 'enable public access block on <bucket>' to block a bucket." if public else None,
+    }, default=str)
 
 
 @tool
@@ -775,55 +819,14 @@ def enable_s3_public_access_block(bucket_name: str) -> str:
 @tool
 def get_s3_bucket_public_access_status(bucket_name: str) -> str:
     """
-    Check the public access block configuration and ACL for a single S3 bucket.
-    Faster than analyze_s3_bucket when you only need the security status.
+    Check whether one S3 bucket is publicly accessible, with the evidence: account- and
+    bucket-level Block Public Access, S3's public-policy verdict, and public ACL grants.
     """
     try:
-        s3 = boto3.client('s3', region_name='us-east-1')
-        result = {'bucket': bucket_name}
-
-        # Public access block
-        try:
-            pab = s3.get_public_access_block(Bucket=bucket_name)
-            result['public_access_block'] = pab['PublicAccessBlockConfiguration']
-            cfg = pab['PublicAccessBlockConfiguration']
-            result['fully_blocked'] = all([
-                cfg.get('BlockPublicAcls', False),
-                cfg.get('IgnorePublicAcls', False),
-                cfg.get('BlockPublicPolicy', False),
-                cfg.get('RestrictPublicBuckets', False),
-            ])
-        except s3.exceptions.NoSuchPublicAccessBlockConfiguration:
-            result['public_access_block'] = 'Not configured'
-            result['fully_blocked'] = False
-
-        # Bucket policy
-        try:
-            policy = s3.get_bucket_policy(Bucket=bucket_name)
-            result['has_bucket_policy'] = True
-            result['bucket_policy'] = json.loads(policy['Policy'])
-        except s3.exceptions.NoSuchBucketPolicy:
-            result['has_bucket_policy'] = False
-
-        # ACL
-        try:
-            acl = s3.get_bucket_acl(Bucket=bucket_name)
-            public_grants = [
-                g for g in acl.get('Grants', [])
-                if 'AllUsers' in g.get('Grantee', {}).get('URI', '') or
-                   'AuthenticatedUsers' in g.get('Grantee', {}).get('URI', '')
-            ]
-            result['public_acl_grants'] = len(public_grants)
-            result['acl_grants'] = [
-                {'permission': g['Permission'],
-                 'grantee': g['Grantee'].get('URI', g['Grantee'].get('ID', 'N/A'))}
-                for g in acl.get('Grants', [])
-            ]
-        except Exception:
-            result['public_acl_grants'] = 'unknown'
-
-        status = '✅ PRIVATE' if result.get('fully_blocked') else '⚠️  POTENTIALLY PUBLIC'
-        return f"S3 Public Access Status for '{bucket_name}' — {status}:\n" + json.dumps(result, indent=2, default=str)
-
+        account_block, account_error = _account_public_access_block()
+        result = _bucket_exposure(bucket_name, account_block, account_error)
+        result["verdict"] = {True: "PUBLIC", False: "NOT PUBLIC", None: "COULD NOT DETERMINE"}[result["public"]]
+        return json.dumps(result, default=str)
     except Exception as e:
-        return f"Error checking public access status for '{bucket_name}': {str(e)}"
+        return json.dumps({"status": "failed", "bucket": bucket_name,
+                           "error": f"Could not check public access ({_error_code(e)}): {e}"})
