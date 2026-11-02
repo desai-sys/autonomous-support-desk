@@ -76,20 +76,20 @@ def run(store, calls, default=None):
     return gate, d, model
 
 
-def test_cross_account_vpc_peering_in_one_turn(store):
-    peer = json.dumps({"VpcId": "vpc-platform", "PeerVpcId": "vpc-444455556666", "PeerOwnerId": "444455556666"})
+def test_cross_account_changes_in_one_turn(store):
+    route = json.dumps({"RouteTableId": "rtb-1", "DestinationCidrBlock": "10.1.0.0/16", "VpcPeeringConnectionId": "pcx-1"})
     gate, d, _ = run(store, [
         ("describe_vpcs", {"account": "platform"}),
         ("describe_vpcs", {"account": "ta-aws-1"}),
-        ("call_aws_api", {"service": "ec2", "operation": "CreateVpcPeeringConnection", "parameters": peer,
+        ("call_aws_api", {"service": "ec2", "operation": "CreateRoute", "parameters": route,
                           "account": "platform"}),
-        ("call_aws_api", {"service": "ec2", "operation": "AcceptVpcPeeringConnection",
-                          "parameters": '{"VpcPeeringConnectionId": "pcx-1"}', "account": "ta-aws-1"}),
+        ("call_aws_api", {"service": "ec2", "operation": "CreateTags",
+                          "parameters": '{"Resources": ["pcx-1"]}', "account": "ta-aws-1"}),
     ])
     # Reads ran immediately, each in its own account; the changes only queued.
     assert seen == [("describe", None), ("describe", "444455556666")]
     assert [(a["tool_input"]["operation"], a["account_id"]) for a in gate.queued] == [
-        ("CreateVpcPeeringConnection", ""), ("AcceptVpcPeeringConnection", "444455556666")]
+        ("CreateRoute", ""), ("CreateTags", "444455556666")]
     assert all("account" not in a["tool_input"] for a in gate.queued)
     assert set(d.used) == {None, "444455556666"}
 
@@ -97,13 +97,13 @@ def test_cross_account_vpc_peering_in_one_turn(store):
                               approver_role="sre", tools={"call_aws_api": call_aws_api}, store=store,
                               stop_on_failure=True)
     assert [r["status"] for r in results] == ["succeeded", "succeeded"]
-    assert seen[2:] == [("CreateVpcPeeringConnection", None), ("AcceptVpcPeeringConnection", "444455556666")]
+    assert seen[2:] == [("CreateRoute", None), ("CreateTags", "444455556666")]
 
 
 def test_stop_on_failure_leaves_later_steps_pending(store):
     gate, _, _ = run(store, [
         ("call_aws_api", {"service": "ec2", "operation": "CreateFail", "account": "platform"}),
-        ("call_aws_api", {"service": "ec2", "operation": "AcceptVpcPeeringConnection", "account": "prod"}),
+        ("call_aws_api", {"service": "ec2", "operation": "CreateTags", "account": "prod"}),
     ])
     first, second = (a["action_id"] for a in gate.queued)
     results = execute_actions([first, second], tenant_id="t1", approver="bob", approver_role="sre",

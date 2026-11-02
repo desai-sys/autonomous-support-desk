@@ -162,8 +162,10 @@ class ApprovalGate(HookProvider):
 
     def __init__(self, store: ActionStore, *, tenant_id: str, session_id: str,
                  requested_by: str, account_id: Optional[str], region: Optional[str],
-                 directory=None):
+                 directory=None, checks=None):
+        from src.core.proposal_checks import ProposalChecks
         self.store = store
+        self.checks = checks if checks is not None else ProposalChecks()
         self.context = dict(tenant_id=tenant_id, session_id=session_id,
                             requested_by=requested_by, account_id=account_id, region=region)
         # With an AccountDirectory, each call's own `account` argument decides where
@@ -186,6 +188,11 @@ class ApprovalGate(HookProvider):
             except ValueError as e:
                 event.cancel_tool = f"NOT EXECUTED: {e}"
                 return
+        problem = self.checks.problem(name, tool_input)
+        if problem:
+            logger.info("action_refused", tool=name, reason=problem)
+            event.cancel_tool = f"NOT QUEUED: {problem}"
+            return
         try:
             action = self.store.create(tool_name=name, tool_input=tool_input, **context)
         except Exception as e:  # never fall through to executing the tool

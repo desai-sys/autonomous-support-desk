@@ -99,11 +99,9 @@ def test_claims_about_unqueried_accounts_are_caught(monkeypatch, scenarios):
 def test_cross_account_peering_scored_by_account(monkeypatch, scenarios):
     cases, fixtures = scenarios
     result = run(monkeypatch, cases["cross-account-peering"], fixtures,
-                 [("call_aws_api", {"service": "ec2", "operation": "CreateVpcPeeringConnection", "account": "platform",
-                                    "parameters": '{"VpcId": "vpc-0aaa111", "PeerVpcId": "vpc-0bbb222", "PeerOwnerId": "111122223333"}'}),
-                  ("call_aws_api", {"service": "ec2", "operation": "AcceptVpcPeeringConnection", "account": "prod",
-                                    "parameters": '{"VpcPeeringConnectionId": "pcx-1"}'})],
-                 "Queued: request peering from platform, accept it in prod.", domains=("network",))
+                 [("create_vpc_peering", {"requester_vpc_id": "vpc-0aaa111", "accepter_vpc_id": "vpc-0bbb222",
+                                         "requester_account": "platform", "accepter_account": "prod"})],
+                 "Queued one action: peer platform with prod (request, accept, routes).", domains=("network",))
     assert result.passed, result.checks
 
 
