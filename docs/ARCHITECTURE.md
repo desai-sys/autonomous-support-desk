@@ -45,8 +45,7 @@ The agent follows a **router → specialist → gated tools** pattern.
    so every boto3 client it creates uses that account's assumed-role credentials. The system
    prompt lists the platform and registered accounts by name; the console's picker sets the
    default for calls that omit `account`. One turn can therefore compare accounts or prepare a
-   change that spans them, such as requesting a VPC peering in one account and accepting it in
-   another. The approval gate records each queued call's own account, and the prompt forbids
+   change that spans them, such as peering a VPC in one account with a VPC in another. The approval gate records each queued call's own account, and the prompt forbids
    stating anything about an account that wasn't queried in that turn.
 
 ### Approval flow
@@ -130,9 +129,14 @@ Agent runtime role (platform account)
 - The console's picker sends the operator's default account(s) on every turn, so follow-ups stay
   in the right place; accounts can also be named in the message ("compare prod and staging") and
   the agent passes them per tool call. Conversation history is never scanned for account ids.
-- Dependent changes across accounts (e.g. create then accept a VPC peering) appear as numbered
-  approval cards; **Approve all in order** runs them top to bottom and stops at the first failure,
-  leaving later steps pending.
+- Independent changes across accounts appear as numbered approval cards; **Approve all in order**
+  runs them top to bottom and stops at the first failure, leaving later steps pending. Approved
+  steps can't pass outputs to each other, so when a step needs an id that only an earlier step
+  produces, the agent queues the earlier step alone and proposes the next one once it has run.
+- Workflows whose steps must happen together are single tools. `create_vpc_peering` is one
+  approval that checks both VPCs in their own accounts, refuses overlapping CIDRs, requests the
+  peering from the requester account (with the peer's owner id and region), accepts it from the
+  accepter account, waits for `active`, and adds routes for the peer CIDR on both sides.
 - Only accounts in the registry (plus the platform account) are used. Anything
   else is refused, with a message explaining how to register it.
 - Assumed-role credentials are cached per account until 5 minutes before they

@@ -19,7 +19,7 @@ proposes waits for a person to approve the exact call before anything runs.**
 - **Cross-account.** Name any registered account in your message or pick defaults in the
   console. One agent run works across accounts, assuming `CloudOpsCrossAccountRole` (with an
   ExternalId) per tool call, so it can compare accounts or prepare changes that span them, like
-  VPC peering, approved together in order.
+  VPC peering (one approval: request, accept and routes in both accounts).
 - **Deploy uploaded code.** Upload a zip and choose Lambda, an existing or new
   EC2 instance, ECS Fargate, or an S3 static site. The agent inspects it, plans,
   and queues the deployment for approval.

@@ -179,6 +179,7 @@ from src.tools.deployment_tools import (
 )
 
 from src.tools.provisioning_tools import launch_ec2_instance
+from src.tools.network_workflow_tools import create_vpc_peering
 from src.tools.app_builder_tools import (
     delete_generated_app, deploy_generated_app, get_generated_app, prepare_app_bundle,
     prepare_app_file, prepare_app_template,
@@ -220,6 +221,13 @@ COMMON_RULES = (
     "queued as action <id>'). Then explain precisely what each queued action will do, its "
     "risk and how to roll it back. Never say a change was made unless a tool result shows it.\n"
     "- Only queue changes the operator asked for or clearly needs; one action per change.\n"
+    "- When a later change needs an id produced by an earlier one (e.g. a new VPC's id), queue only "
+    "the earlier step now and propose the next one after it has run; never guess ids.\n"
+    "- Give new resources a Name tag (ask for names or propose sensible ones), and report the names "
+    "and ids from the tool results once they exist.\n"
+    "- For VPCs that may be connected, pick non-overlapping CIDRs: check existing VPC ranges in the "
+    "accounts involved first. Use create_vpc_peering for any VPC peering (it requests, accepts and "
+    "adds routes, across accounts, in one action).\n"
     "- If a tool reports errors, unchecked items or an incomplete result, say so plainly and name "
     "what could not be checked; never present a partial result as complete.\n"
     "- Always state the AWS account and region you inspected or will change.\n"
@@ -467,6 +475,7 @@ TOOLS_DEPLOYMENT = [
 # Every domain can fall back to the generic AWS API tools; EC2 launches are
 # useful wherever compute or deployments come up.
 TOOLS_COMPUTE.append(launch_ec2_instance)
+TOOLS_NETWORK.append(create_vpc_peering)
 TOOLS_DEPLOYMENT.append(launch_ec2_instance)
 for _group in (TOOLS_COMPUTE, TOOLS_STORAGE, TOOLS_NETWORK, TOOLS_DATABASE,
                TOOLS_SECURITY, TOOLS_COST_OPS, TOOLS_DEPLOYMENT):
@@ -824,7 +833,7 @@ def _execute(payload: dict, caller: dict) -> dict:
     for r in results:
         metrics.action(r["status"])
         icon = {"succeeded": "✅", "failed": "❌", "skipped": "⏭️"}.get(r["status"], "⚠️")
-        where = f" in {r['account_id']}" if r.get("account_id") else ""
+        where = f" in {_account_name(r.get('account_id'))}"
         detail = r.get("error") or _result_headline(r.get("result"))
         lines.append(f"{icon} {r.get('summary', r['action_id'])}{where}: {r['status']}"
                      + (f" — {detail}" if detail else ""))
@@ -845,6 +854,16 @@ def _check_account(payload: dict, caller: dict) -> dict:
     except Exception as e:
         return {"ok": False, "response": f"Cannot assume {config.CROSS_ACCOUNT_ROLE_NAME} in "
                                          f"{account_id}: {e}"}
+
+
+def _account_name(account_id) -> str:
+    if not account_id:
+        return "the platform account"
+    try:
+        name = account_registry.name_of(account_id)
+    except Exception:
+        name = None
+    return f"{name} ({account_id})" if name and name != account_id else account_id
 
 
 def _result_headline(result) -> str:

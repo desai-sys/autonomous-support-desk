@@ -131,3 +131,16 @@ class AccountScopedTool(AgentTool):
 
 def scope_tools(tools: Iterable[AgentTool], directory: AccountDirectory) -> list:
     return [AccountScopedTool(t, directory) for t in tools]
+
+
+def resolve_account_ref(ref: Any) -> Optional[str]:
+    """
+    Resolve 'platform' / a registered account's name or id to an account id (None =
+    platform) outside an agent run, e.g. for tools that act in two accounts at once.
+    Uses the account registry, so it works both while proposing and when an approved
+    action is executed later.
+    """
+    from src.core.accounts import AccountRegistry
+    from src.core.aws_clients import base_account_id
+    registered = {a: info.get("name") or a for a, info in AccountRegistry().list().items()}
+    return AccountDirectory(base_account_id(), registered).resolve(ref or "platform")
