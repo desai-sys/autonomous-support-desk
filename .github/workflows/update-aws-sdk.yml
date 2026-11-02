@@ -1,0 +1,75 @@
+name: Update AWS SDK
+
+# Weekly: bump boto3/botocore to the latest release (new AWS services, operations
+# and parameters), regenerate the agent's linux/arm64 lock, run the full checks,
+# and open a pull request if they pass.
+#
+# Needs: Settings → Actions → General → "Allow GitHub Actions to create and
+# approve pull requests". Pull requests opened with the workflow token don't
+# trigger other workflows, so this job runs the same checks as CI itself.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"   # Mondays 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-aws-sdk
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bump boto3/botocore and regenerate the agent lock
+        id: bump
+        run: |
+          pip install uv
+          python scripts/update_deps.py
+      - name: Check for an open update for this version
+        id: existing
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="deps/aws-sdk-${{ steps.bump.outputs.boto3 }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.bump.outputs.changed == 'true' && steps.existing.outputs.exists != 'true'
+        with:
+          node-version: "22"
+      - name: Run the checks
+        if: steps.bump.outputs.changed == 'true' && steps.existing.outputs.exists != 'true'
+        run: |
+          (cd web && npm ci --no-audit --no-fund && npm run build)
+          pip install -r requirements/dev.txt
+          cfn-lint infra/*.yaml
+          pytest -q
+          python -c "import sys; sys.path.insert(0, 'scripts'); import deploy; deploy.build_agent_package()"
+      - name: Open a pull request
+        if: steps.bump.outputs.changed == 'true' && steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.existing.outputs.branch }}
+          SUMMARY: ${{ steps.bump.outputs.summary }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add requirements/
+          git commit -m "Update AWS SDK: $SUMMARY"
+          git push -u origin "$BRANCH"
+          gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+            --title "Update AWS SDK: $SUMMARY" \
+            --body "Weekly AWS SDK update: $SUMMARY. The agent lock was regenerated for linux/arm64. Tests, cfn-lint, the web build and the agent package build passed in this workflow run. After merging, re-run scripts/deploy.py so the agent and console pick up the new APIs."

@@ -9,7 +9,8 @@ runs only when an operator, SRE or admin clicks **Approve**. Viewers get read-on
 
 If details are missing (for example the instance type for a new EC2 instance), the agent asks
 once and proposes defaults. Anything without a dedicated tool is still possible: the agent uses
-`query_aws_api` for read-only AWS operations and `call_aws_api` for any change (approval-gated).
+`query_aws_api` for read-only AWS operations and `call_aws_api` for any change (approval-gated),
+after checking the operation's current parameters with `describe_aws_operation`.
 
 | Action | Sample Query |
 |--------|-------------|

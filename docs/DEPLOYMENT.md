@@ -240,7 +240,24 @@ other account are refused.
 
 ## Updating
 
-Pull the new code and re-run `deploy.py` with the same options. The agent
+Pull the new code and re-run `deploy.py` with the same options.
+
+**Staying current with AWS.** New AWS services, operations and parameters arrive in boto3/botocore
+releases. Every Monday the **Update AWS SDK** GitHub workflow bumps them to the latest release,
+regenerates the agent's dependency lock, runs the tests, template checks and builds, and opens a
+pull request if everything passes. Merge it and re-run `deploy.py`. Enable it once in GitHub under
+**Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**; you
+can also run it on demand from the **Actions** tab. Dependabot keeps the web app's npm packages and
+the workflow actions up to date the same way. To bump by hand:
+
+```bash
+pip install uv
+```
+
+```bash
+python scripts/update_deps.py
+```
+ The agent
 package and console image are rebuilt only if their contents changed. ECS rolls
 out new console tasks with a circuit breaker that rolls back automatically if
 the new tasks fail health checks.
