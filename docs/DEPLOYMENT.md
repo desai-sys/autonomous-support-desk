@@ -15,8 +15,8 @@ re-run at any time to update the deployment.
 
 | Stack | Contents |
 |---|---|
-| `<app>-foundation` | DynamoDB tables (tickets, audit, actions, accounts, usage), S3 buckets (artifacts, knowledge), Bedrock knowledge base on S3 Vectors, Cognito user pool with `admin`/`sre`/`operator`/`viewer` groups, generated secrets, ECR repository and a CodeBuild project that builds the console image |
-| `<app>-app` | Bedrock AgentCore Runtime running the agent, VPC (2 AZs, private subnets, 1 NAT gateway), ALB, ECS Fargate console service (ARM64, auto scaling), CloudFront (HTTPS) with AWS WAF, Cognito app client, hourly learning-loop task, CloudWatch alarms and dashboard |
+| `<app>-foundation` | DynamoDB tables (tickets, audit, actions, accounts, usage, jobs), S3 buckets (artifacts, knowledge), Bedrock knowledge base on S3 Vectors, Cognito user pool with `admin`/`sre`/`operator`/`viewer` groups, generated secrets, ECR repository and a CodeBuild project that builds the console image |
+| `<app>-app` | Bedrock AgentCore Runtime running the agent, VPC (2 AZs, private subnets, 1 NAT gateway), ALB, ECS Fargate console service (React web app + FastAPI, ARM64, auto scaling), CloudFront (HTTPS) with AWS WAF, Cognito app client, hourly learning-loop task, CloudWatch alarms and dashboard |
 | `cloudops-cross-account` (per managed account) | `CloudOpsCrossAccountRole`, which the agent assumes, plus service roles used by code deployments |
 
 `<app>` is `cloudops` unless you pass `--app-name`.
@@ -262,11 +262,23 @@ package and console image are rebuilt only if their contents changed. ECS rolls
 out new console tasks with a circuit breaker that rolls back automatically if
 the new tasks fail health checks.
 
+## Evaluating the agent
+
+To measure how well the agent behaves with your models (routing, tool choice, proposed changes,
+account targeting, groundedness, injection resistance, latency and tokens), run the scenario
+evaluation. It calls only Bedrock and never touches your AWS resources; see
+[EVALUATION.md](EVALUATION.md).
+
+```bash
+python evals/run_evals.py --region us-east-1
+```
+
 ## Monitoring
 
 | Where | What |
 |---|---|
 | CloudWatch dashboard `<app>-<env>` | Agent requests, errors and p90 latency; approved actions (succeeded/failed); console traffic and 5xx errors |
+| Metrics `ModelInputTokens` / `ModelOutputTokens` (namespace `CloudOps`) | Model token usage per model, for cost tracking |
 | SNS topic `<app>-alarms` (subscribed to `--alarm-email`) | Unhealthy console tasks, console 5xx errors, agent errors, failed approved actions |
 | Log group `/<app>/console` | Console and learning-loop logs (JSON) |
 | Log groups `/aws/bedrock-agentcore/runtimes/<app>_agent-*` | Agent logs (JSON, including every queued and executed action) |
@@ -280,7 +292,8 @@ the new tasks fail health checks.
   No language model is involved in that step. Approvals expire after an hour.
 - **Identity.** Users authenticate with Cognito (OIDC, optional MFA). Their
   role comes from Cognito groups and their tenant from a user attribute they
-  can't change themselves.
+  can't change themselves. The console keeps the session in a signed, HTTP-only
+  cookie and rejects state-changing requests without its custom header (CSRF).
 - **Network.** HTTPS ends at CloudFront, with AWS WAF in us-east-1. The load
   balancer only accepts CloudFront's IP ranges carrying a secret header. Console
   tasks run in private subnets.

@@ -15,11 +15,14 @@ _user: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("cloudop
 _session: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("cloudops_session", default=None)
 # App-builder drafts assembled during this request: {app_id: {"files": {...}, "template": str}}.
 _drafts: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar("cloudops_drafts", default=None)
+# Model tokens used by this request: {"input": n, "output": n}.
+_usage: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar("cloudops_usage", default=None)
 
 
 @contextlib.contextmanager
 def bind(tenant_id: str, user_id: str, session_id: str = ""):
-    tokens = (_tenant.set(tenant_id), _user.set(user_id), _session.set(session_id), _drafts.set({}))
+    tokens = (_tenant.set(tenant_id), _user.set(user_id), _session.set(session_id), _drafts.set({}),
+              _usage.set({"input": 0, "output": 0}))
     try:
         yield
     finally:
@@ -27,6 +30,7 @@ def bind(tenant_id: str, user_id: str, session_id: str = ""):
         _user.reset(tokens[1])
         _session.reset(tokens[2])
         _drafts.reset(tokens[3])
+        _usage.reset(tokens[4])
 
 
 def tenant_id() -> str:
@@ -49,3 +53,14 @@ def draft(app_id: str) -> dict:
         drafts = {}
         _drafts.set(drafts)
     return drafts.setdefault(app_id, {"files": {}, "template": ""})
+
+
+def record_usage(input_tokens: int, output_tokens: int) -> None:
+    usage = _usage.get()
+    if usage is not None:
+        usage["input"] += int(input_tokens or 0)
+        usage["output"] += int(output_tokens or 0)
+
+
+def usage() -> dict:
+    return dict(_usage.get() or {"input": 0, "output": 0})

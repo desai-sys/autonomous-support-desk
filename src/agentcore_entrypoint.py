@@ -642,6 +642,7 @@ def _chat(payload: dict, caller: dict) -> dict:
         "refused_accounts": refused,
         "pending_actions": gate.queued,
         "escalate": "ESCALATE" in response.upper() and not gate.queued,
+        "usage": request_context.usage(),
     }
 
 
@@ -789,6 +790,13 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
                        system_prompt=system_prompt + (
                            "\n\nYour previous attempt failed because a tool call was malformed. "
                            "Keep every tool call small: one file per call, plain text content."))(prompt)
+    try:
+        tokens = result.metrics.accumulated_usage
+        request_context.record_usage(tokens.get("inputTokens", 0), tokens.get("outputTokens", 0))
+        metrics.put("ModelInputTokens", tokens.get("inputTokens", 0), "Count", {"Model": model.config["model_id"]})
+        metrics.put("ModelOutputTokens", tokens.get("outputTokens", 0), "Count", {"Model": model.config["model_id"]})
+    except Exception:  # usage is best-effort telemetry
+        pass
     text = _THINKING_RE.sub("", str(result)).strip()
     return text, domains, len(tools)
 
