@@ -152,3 +152,14 @@ def test_gateway_reports_agent_outage(gateway):
     gateway.client.invoke_agent_runtime.side_effect = RuntimeError("boom")
     res = gateway.chat("hi", user(), "conv-1")
     assert res.escalate and "unavailable" in res.text
+
+
+def test_account_name_labels_results(tables, monkeypatch):
+    import src.agentcore_entrypoint as ep
+    from src.core.accounts import AccountRegistry
+    reg = AccountRegistry()
+    reg.add("111111111111", "ta-aws-1", "admin")
+    monkeypatch.setattr(ep, "account_registry", reg)
+    assert ep._account_name("111111111111") == "ta-aws-1 (111111111111)"
+    assert ep._account_name(None) == "the platform account"
+    assert ep._account_name("222222222222") == "222222222222"

@@ -63,9 +63,10 @@ that exact call executes; click **Reject** and nothing happens.
 ### Work across accounts
 Name accounts in the message ("in platform and ta-aws-1, which buckets are public, separately?")
 or pick defaults in the header. One agent run works across all of them. Changes that span
-accounts, such as requesting a VPC peering in one account and accepting it in another, become
-numbered approval cards that you can run with **Approve all in order**, which stops at the
-first failure.
+accounts become numbered approval cards that you can run with **Approve all in order**, which
+stops at the first failure. Workflows whose steps depend on each other are single tools: "peer
+these two VPCs" is one approval that requests the peering in one account, accepts it in the
+other and adds routes on both sides, after checking the CIDRs don't overlap.
 
 ### Deploy code you upload
 Drop a zip into the console and choose Lambda, an existing or new EC2 instance, ECS Fargate

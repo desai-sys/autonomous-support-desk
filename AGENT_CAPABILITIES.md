@@ -375,7 +375,7 @@ be used. Changes that span accounts appear as numbered approval cards that you c
 | Act on multiple accounts | "check for public S3 buckets in accounts 111122223333 and 444455556666" |
 | Audit several accounts | "list IAM users without MFA in prod and ta-aws-1" |
 | Compare by name | "in platform and ta-aws-1, which S3 buckets are public? Give them separately" |
-| Cross-account change | "peer vpc-0abc in the platform account with vpc-0def in prod" |
+| Cross-account change | "peer vpc-0abc in the platform account with vpc-0def in prod" (one approval: request, accept, routes) |
 
 ---
 
