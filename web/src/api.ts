@@ -59,6 +59,8 @@ export const api = {
   pending: (conversationId: string) => request<PendingAction[]>(`/api/conversations/${conversationId}/actions`),
   approve: (actionId: string, conversationId: string, onTick?: (s: number) => void) =>
     runJob<ApproveResult>(post(`/api/actions/${actionId}/approve`, { conversation_id: conversationId }), onTick),
+  approveAll: (actionIds: string[], conversationId: string, onTick?: (s: number) => void) =>
+    runJob<ApproveResult>(post("/api/actions/approve-batch", { action_ids: actionIds, conversation_id: conversationId }), onTick),
   reject: (actionId: string) => post(`/api/actions/${actionId}/reject`),
   appBundle: (appId: string, version: number) => request<AppBundle>(`/api/apps/${appId}/versions/${version}`),
   upload: (file: File, target: string, options: Record<string, string>) => {

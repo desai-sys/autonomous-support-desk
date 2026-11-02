@@ -197,30 +197,12 @@ class TestEntrypointTargeting:
         monkeypatch.setattr(ep.account_registry, "list",
                             lambda: {"111122223333": {}, "444455556666": {}})
 
-    def test_explicit_empty_list_pins_platform_account(self):
-        payload = {"account_ids": [], "user_message": "check 111122223333"}
-        assert self.ep._resolve_accounts(payload, "check 111122223333") == ([None], [])
-
-    def test_explicit_accounts_win(self):
-        payload = {"account_ids": ["111122223333", "444455556666"]}
-        assert self.ep._resolve_accounts(payload, "anything 777788889999") == (
-            ["111122223333", "444455556666"], [])
-
-    def test_unregistered_accounts_are_refused(self):
-        payload = {"account_ids": ["111122223333", "777788889999"]}
-        assert self.ep._resolve_accounts(payload, "") == (["111122223333"], ["777788889999"])
-
-    def test_platform_account_id_maps_to_ambient_credentials(self):
-        assert self.ep._resolve_accounts({"account_ids": ["999999999999"]}, "") == ([None], [])
-
-    def test_history_is_not_scanned(self):
-        prompt = ("Conversation so far:\nAssistant: role arn:aws:iam::111122223333:role/x\n\n"
-                  "User: yes go ahead")
-        assert self.ep._resolve_accounts({"user_message": "yes go ahead"}, prompt) == ([None], [])
-
-    def test_latest_message_accounts_still_work_without_explicit_list(self):
-        payload = {"user_message": "list buckets in 111122223333"}
-        assert self.ep._resolve_accounts(payload, "") == (["111122223333"], [])
+    def test_selected_accounts(self):
+        registered = {"111122223333", "444455556666"}
+        assert self.ep._selected_accounts({"account_ids": []}, registered) == ([], [])
+        assert self.ep._selected_accounts({"account_ids": ["111122223333", "777788889999", "999999999999"]},
+                                          registered) == (["111122223333"], ["777788889999"])
+        assert self.ep._selected_accounts({"account_id": "444455556666"}, registered) == (["444455556666"], [])
 
     def test_context_notes_include_artifact_region_and_read_only(self):
         notes = self.ep._build_context_notes(
@@ -238,7 +220,7 @@ class TestEntrypointTargeting:
         captured = {}
         monkeypatch.setattr(self.ep.router, "route", lambda *a, **k: ["storage"])
 
-        def fake_run(prompt, domains, notes, gate, read_only=False):
+        def fake_run(prompt, domains, notes, gate, read_only=False, directory=None):
             captured["domains"] = domains
             return "ok", domains, 1
         monkeypatch.setattr(self.ep, "_run_agent_with_domains", fake_run)

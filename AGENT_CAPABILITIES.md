@@ -362,18 +362,19 @@ default (Lambda, API Gateway/function URLs, DynamoDB, S3, SQS, EventBridge).
 
 ## Targeting a Specific Account
 
-By default every request acts on the platform account (where the agent runs). In the
-Command Center, choose accounts in the sidebar's **Target accounts** picker, or type a
-registered 12-digit account ID in the message; it is added to the picker so follow-ups
-stay on that account. Only accounts an admin registered on the **Accounts** page can be
-targeted. The agent assumes `CloudOpsCrossAccountRole` there and states which account it
-acted on. Pick several accounts to fan out across all of them.
+Name accounts in your message (by their registered name or 12-digit id, or "platform") and the
+agent works in each of them within one request; the sidebar's **Target accounts** picker sets the
+default when you don't name one. Only accounts an admin registered on the **Accounts** page can
+be used. Changes that span accounts appear as numbered approval cards that you can run with
+**Approve all in order**.
 
 | Action | Sample Query |
 |--------|-------------|
 | Act on another account | "list EC2 instances in account 123456789012" |
 | Act on multiple accounts | "check for public S3 buckets in accounts 111122223333 and 444455556666" |
 | Fan-out audit | "list IAM users without MFA across accounts 111122223333, 444455556666" |
+| Compare by name | "in platform and ta-aws-1, which S3 buckets are public? Give them separately" |
+| Cross-account change | "peer vpc-0abc in the platform account with vpc-0def in prod" |
 
 ---
 

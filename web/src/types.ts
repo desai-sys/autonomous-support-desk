@@ -61,7 +61,7 @@ export interface ActionResult {
   summary?: string;
   account_id?: string | null;
   region?: string | null;
-  status: "succeeded" | "failed" | "error";
+  status: "succeeded" | "failed" | "error" | "skipped";
   result?: string;
   error?: string;
 }

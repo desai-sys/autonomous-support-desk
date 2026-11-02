@@ -29,7 +29,7 @@ def payload(**kw):
 def test_chat_returns_pending_actions_and_execute_runs_them(ep, monkeypatch):
     ran = []
 
-    def fake_run(prompt, domains, notes, gate, read_only=False):
+    def fake_run(prompt, domains, notes, gate, read_only=False, directory=None):
         # What the ApprovalGate does when the model calls a mutating tool.
         gate.queued.append(gate.store.create(tool_name="stop_ec2_instance",
                                              tool_input={"instance_id": "i-1"}, **gate.context))
@@ -56,28 +56,45 @@ def test_chat_returns_pending_actions_and_execute_runs_them(ep, monkeypatch):
 def test_viewer_chat_is_read_only(ep, monkeypatch):
     seen = {}
     monkeypatch.setattr(ep, "_run_agent_with_domains",
-                        lambda prompt, domains, notes, gate, read_only=False:
+                        lambda prompt, domains, notes, gate, read_only=False, directory=None:
                         seen.update(read_only=read_only, notes=notes) or ("ok", domains, 1))
     ep.invoke(payload(user={"id": "v", "role": "viewer"}))
     assert seen["read_only"] and any("READ-ONLY" in n for n in seen["notes"])
 
 
-def test_multi_account_fan_out_and_unregistered_refusal(ep, monkeypatch):
+def test_single_run_sees_every_registered_account(ep, monkeypatch):
     ep.account_registry.add("111122223333", "prod", "admin")
-    ep.account_registry.add("444455556666", "dev", "admin")
-    seen = []
+    ep.account_registry.add("444455556666", "ta-aws-1", "admin")
+    runs = []
 
-    def fake_run(prompt, domains, notes, gate, read_only=False):
-        from src.core.aws_clients import get_active_account
-        seen.append((get_active_account(), gate.context["account_id"]))
-        return f"report for {get_active_account()}", domains, 3
+    def fake_run(prompt, domains, notes, gate, read_only=False, directory=None):
+        runs.append({"notes": notes, "directory": directory, "gate": gate})
+        directory.resolve("platform")
+        directory.resolve("ta-aws-1")
+        return "Platform: 0 public. ta-aws-1: 1 public.", domains, 3
     monkeypatch.setattr(ep, "_run_agent_with_domains", fake_run)
 
-    out = ep.invoke(payload(account_ids=["111122223333", "444455556666", "777788889999"]))
-    assert seen == [("111122223333", "111122223333"), ("444455556666", "444455556666")]
-    assert "=== Account 111122223333 ===" in out["response"]
-    assert "777788889999 is not registered" in out["response"]
-    assert {r["account_id"] for r in out["per_account"]} == {"111122223333", "444455556666", "777788889999"}
+    out = ep.invoke(payload(account_ids=[], user_message="public buckets in platform and ta-aws-1, and 777788889999"))
+    [r] = runs                                               # one run, not one per account
+    assert r["gate"].directory is r["directory"]
+    assert set(r["directory"].registered) == {"111122223333", "444455556666"}
+    joined = "\n".join(r["notes"])
+    assert "ta-aws-1 — 444455556666" in joined and "777788889999 are not registered" in joined
+    assert out["accounts"] == ["platform account (999999999999)", "ta-aws-1 (444455556666)"]
+    assert out["refused_accounts"] == ["777788889999"]
+
+
+def test_selected_accounts_become_default_or_each(ep, monkeypatch):
+    ep.account_registry.add("111122223333", "prod", "admin")
+    ep.account_registry.add("444455556666", "dev", "admin")
+    runs = []
+    monkeypatch.setattr(ep, "_run_agent_with_domains",
+                        lambda prompt, domains, notes, gate, read_only=False, directory=None:
+                        runs.append((notes, directory)) or ("ok", domains, 1))
+    ep.invoke(payload(account_ids=["111122223333"]))
+    assert runs[-1][1].default == "111122223333"
+    ep.invoke(payload(account_ids=["111122223333", "444455556666"]))
+    assert runs[-1][1].default is None and any("SELECTED ACCOUNTS" in n for n in runs[-1][0])
 
 
 def test_escalation_flag(ep, monkeypatch):
