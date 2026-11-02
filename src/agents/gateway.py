@@ -120,9 +120,11 @@ class AgentGateway:
         return ChatResult(text=text_out, resolution_type="escalated" if escalate else "action",
                           escalate=escalate, pending_actions=pending, metadata=meta)
 
-    def approve(self, action_ids: List[str], user: User, session_id: str) -> dict:
+    def approve(self, action_ids: List[str], user: User, session_id: str,
+                stop_on_failure: bool = False) -> dict:
         try:
-            return self._invoke({"mode": "execute", "action_ids": action_ids}, user, session_id)
+            return self._invoke({"mode": "execute", "action_ids": action_ids,
+                                 "stop_on_failure": stop_on_failure}, user, session_id)
         except Exception as e:
             logger.error("execute_invocation_failed", error=str(e))
             return {"response": f"The agent is unavailable: {e}", "results": [], "error": "Unavailable"}

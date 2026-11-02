@@ -16,9 +16,10 @@ proposes waits for a person to approve the exact call before anything runs.**
   queued with their exact arguments, target account and region. Approving runs
   that stored call exactly once, with no LLM involved. Requests can be required
   to come from a different person than the approver.
-- **Cross-account.** Pick target accounts in the console. The agent assumes
-  `CloudOpsCrossAccountRole` (with an ExternalId) in each registered account,
-  fans out, and reports per account.
+- **Cross-account.** Name any registered account in your message or pick defaults in the
+  console. One agent run works across accounts, assuming `CloudOpsCrossAccountRole` (with an
+  ExternalId) per tool call, so it can compare accounts or prepare changes that span them, like
+  VPC peering, approved together in order.
 - **Deploy uploaded code.** Upload a zip and choose Lambda, an existing or new
   EC2 instance, ECS Fargate, or an S3 static site. The agent inspects it, plans,
   and queues the deployment for approval.

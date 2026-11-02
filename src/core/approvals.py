@@ -161,10 +161,14 @@ class ApprovalGate(HookProvider):
     """
 
     def __init__(self, store: ActionStore, *, tenant_id: str, session_id: str,
-                 requested_by: str, account_id: Optional[str], region: Optional[str]):
+                 requested_by: str, account_id: Optional[str], region: Optional[str],
+                 directory=None):
         self.store = store
         self.context = dict(tenant_id=tenant_id, session_id=session_id,
                             requested_by=requested_by, account_id=account_id, region=region)
+        # With an AccountDirectory, each call's own `account` argument decides where
+        # the queued action will run (see src/core/account_scope.py).
+        self.directory = directory
         self.queued: List[dict] = []
 
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
@@ -174,9 +178,16 @@ class ApprovalGate(HookProvider):
         name = event.tool_use.get("name", "")
         if not is_mutating(name):
             return
-        tool_input = event.tool_use.get("input") or {}
+        tool_input = dict(event.tool_use.get("input") or {})
+        context = dict(self.context)
+        if self.directory is not None:
+            try:
+                context["account_id"] = self.directory.resolve(tool_input.pop("account", None))
+            except ValueError as e:
+                event.cancel_tool = f"NOT EXECUTED: {e}"
+                return
         try:
-            action = self.store.create(tool_name=name, tool_input=tool_input, **self.context)
+            action = self.store.create(tool_name=name, tool_input=tool_input, **context)
         except Exception as e:  # never fall through to executing the tool
             logger.error("action_queue_failed", tool=name, error=str(e))
             event.cancel_tool = (
@@ -205,9 +216,12 @@ def _result_failed(result) -> bool:
 
 def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, approver_role: str,
                     tools: Dict[str, Callable], store: ActionStore = None,
-                    audit: Callable[..., None] = None) -> List[dict]:
+                    audit: Callable[..., None] = None, stop_on_failure: bool = False) -> List[dict]:
     """
-    Run approved actions exactly as they were recorded.
+    Run approved actions exactly as they were recorded, in the order given.
+
+    With ``stop_on_failure`` (dependent steps such as create-then-accept a VPC
+    peering), the remaining actions are skipped and stay pending after a failure.
 
     Returns one entry per id: {action_id, summary, account_id, region, status, result|error}.
     """
@@ -216,6 +230,9 @@ def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, app
     for action_id in action_ids:
         entry = {"action_id": action_id}
         results.append(entry)
+        if stop_on_failure and any(r["status"] in (STATUS_FAILED, "error") for r in results[:-1]):
+            entry.update(status="skipped", error="Skipped because an earlier step failed; still pending.")
+            continue
 
         action = store.get(action_id)
         if not action or action["tenant_id"] != tenant_id:

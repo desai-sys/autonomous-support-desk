@@ -152,6 +152,19 @@ def approve(action_id: str, body: Decision, user: User = Depends(require_user)):
                                     lambda: gateway().approve([action_id], user, body.conversation_id))}
 
 
+class BatchDecision(BaseModel):
+    conversation_id: str
+    action_ids: List[str] = Field(min_length=1, max_length=20)
+
+
+@router.post("/actions/approve-batch")
+def approve_batch(body: BatchDecision, user: User = Depends(require_user)):
+    """Approve several actions to run in the given order, stopping at the first failure."""
+    need(user, Permission.APPROVE_CHANGES)
+    return {"job_id": jobs().submit(user.user_id, "approve", lambda: gateway().approve(
+        body.action_ids, user, body.conversation_id, stop_on_failure=True))}
+
+
 @router.post("/actions/{action_id}/reject")
 def reject(action_id: str, user: User = Depends(require_user)):
     need(user, Permission.APPROVE_CHANGES)

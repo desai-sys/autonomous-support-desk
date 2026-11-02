@@ -32,7 +32,7 @@ export function TargetBar({ accounts, selected, onSelected, region, regions, onR
       <button className="chip hover:border-brand-500/60" onClick={() => setOpen(open === "region" ? null : "region")}>
         <MapPin size={13} className="text-accent-400" /> {region} <ChevronDown size={13} className="muted" />
       </button>
-      {selected.length > 1 && <span className="text-xs muted">runs in each account</span>}
+      <span className="hidden text-xs muted lg:inline">default target · name other accounts in your message</span>
 
       {open === "accounts" && (
         <div className="panel absolute left-0 top-9 z-30 w-80 animate-rise p-2 shadow-xl">
@@ -51,6 +51,10 @@ export function TargetBar({ accounts, selected, onSelected, region, regions, onR
             </button>
           ))}
           {!accounts.length && <div className="px-3 py-3 text-xs muted">No other accounts registered yet. Admins add them on the Accounts page.</div>}
+          <div className="mt-1 border-t hairline px-3 pt-2 text-[11px] muted">
+            This is the default. You can also name accounts in your message, e.g. “compare prod and staging”
+            or “peer vpc-1 in platform with vpc-2 in prod”.
+          </div>
         </div>
       )}
       {open === "region" && (

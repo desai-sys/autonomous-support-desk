@@ -36,10 +36,15 @@ The agent follows a **router → specialist → gated tools** pattern.
    is intercepted by `ApprovalGate`, a Strands `BeforeToolCallEvent` hook. The
    hook records the call as a pending action and cancels it, and the model is
    told the call was queued, not that it ran.
-4. **Fan out.** When several accounts are targeted, the same prompt runs once
-   per account inside `use_account(account)`. Every boto3 client a tool creates
-   then uses that account's assumed-role credentials. Each run gets its own gate,
-   so queued actions remember their account.
+4. **Work across accounts in one run.** Every tool the agent sees is wrapped by
+   `AccountScopedTool` (`src/core/account_scope.py`), which adds an optional `account` argument
+   (`platform`, or a registered account's name or id). Each call runs inside `use_account(...)`,
+   so every boto3 client it creates uses that account's assumed-role credentials. The system
+   prompt lists the platform and registered accounts by name; the console's picker sets the
+   default for calls that omit `account`. One turn can therefore compare accounts or prepare a
+   change that spans them, such as requesting a VPC peering in one account and accepting it in
+   another. The approval gate records each queued call's own account, and the prompt forbids
+   stating anything about an account that wasn't queried in that turn.
 
 ### Approval flow
 
@@ -119,9 +124,12 @@ Agent runtime role (platform account)
                                           PowerUserAccess + scoped IAM, or ReadOnlyAccess
 ```
 
-- Targets come from the console's picker, sent as `account_ids` on **every**
-  turn, so a follow-up stays in the right account. Bare 12-digit IDs typed in
-  the latest message also count. Conversation history is never scanned.
+- The console's picker sends the operator's default account(s) on every turn, so follow-ups stay
+  in the right place; accounts can also be named in the message ("compare prod and staging") and
+  the agent passes them per tool call. Conversation history is never scanned for account ids.
+- Dependent changes across accounts (e.g. create then accept a VPC peering) appear as numbered
+  approval cards; **Approve all in order** runs them top to bottom and stops at the first failure,
+  leaving later steps pending.
 - Only accounts in the registry (plus the platform account) are used. Anything
   else is refused, with a message explaining how to register it.
 - Assumed-role credentials are cached per account until 5 minutes before they

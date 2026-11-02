@@ -126,6 +126,26 @@ export function CommandCenter({ me }: { me: Me }) {
     }
   };
 
+  const approveAll = async (ids: string[]) => {
+    setBusyAction("all");
+    setWorking({ kind: "approve", seconds: 0 });
+    setMood("thinking");
+    try {
+      const result = await api.approveAll(ids, active.id, (s) => setWorking({ kind: "approve", seconds: s }));
+      const ok = result.results.length > 0 && result.results.every((r) => r.status === "succeeded");
+      add({ role: "assistant", text: result.response || "Done.", kind: ok ? "result" : "error", meta: { results: result.results } });
+      if (ok) { celebrate(); setMood("happy"); toast.success(`${ids.length} changes applied`); }
+      else { setMood("sad"); toast.error("Stopped at a failed step — later steps are still pending"); }
+    } catch (e) {
+      add({ role: "assistant", text: `⚠️ ${(e as Error).message}`, kind: "error" });
+      setMood("sad");
+    } finally {
+      setBusyAction(null);
+      setWorking(null);
+      queryClient.invalidateQueries({ queryKey: ["pending", active.id] });
+    }
+  };
+
   const reject = async (actionId: string, summary: string) => {
     try {
       await api.reject(actionId);
@@ -213,13 +233,25 @@ export function CommandCenter({ me }: { me: Me }) {
 
           {actions.length > 0 && (
             <div className="space-y-3 pt-2">
-              <div className="flex items-center gap-2 text-sm font-semibold">
+              <div className="flex flex-wrap items-center gap-2 text-sm font-semibold">
                 <AgentAvatar mood="waiting" size={28} />
                 {actions.length} change{actions.length > 1 ? "s" : ""} waiting for your approval
+                {actions.length > 1 && can(me, "approve_changes") && (
+                  <button className="btn btn-success ml-auto py-1.5" disabled={!!busyAction}
+                    title="Runs the changes top to bottom and stops at the first failure"
+                    onClick={() => approveAll([...actions].sort((a, b) => a.created_at.localeCompare(b.created_at)).map((a) => a.action_id))}>
+                    Approve all in order
+                  </button>
+                )}
               </div>
-              {actions.map((a) => (
-                <ApprovalCard key={a.action_id} action={a} me={me} accounts={registered} busy={busyAction === a.action_id}
+              {[...actions].sort((a, b) => a.created_at.localeCompare(b.created_at)).map((a, i) => (
+                <div key={a.action_id} className="relative">
+                {actions.length > 1 && (
+                  <span className="absolute -left-3 top-4 z-10 grid h-6 w-6 place-items-center rounded-full bg-amber-400 text-xs font-bold text-black">{i + 1}</span>
+                )}
+                <ApprovalCard action={a} me={me} accounts={registered} busy={busyAction === a.action_id || busyAction === "all"}
                   onApprove={() => approve(a.action_id)} onReject={() => reject(a.action_id, a.summary)} />
+                </div>
               ))}
             </div>
           )}

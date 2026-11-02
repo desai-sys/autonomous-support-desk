@@ -172,3 +172,20 @@ def test_single_page_app_routes_fall_back_to_index(client, tmp_path, monkeypatch
         res = client.get(path)
         assert res.status_code == 200 and "<div id=\"root\">" in res.text
     assert client.head("/tickets").status_code == 200
+
+
+def test_approve_all_in_order_stops_on_failure(client, monkeypatch):
+    seen = {}
+
+    def approve(self, action_ids, user, session_id, stop_on_failure=False):
+        seen.update(ids=action_ids, stop=stop_on_failure)
+        return {"response": "ok", "results": [{"action_id": i, "status": "succeeded"} for i in action_ids]}
+    monkeypatch.setattr("src.agents.gateway.AgentGateway.approve", approve)
+    login(client, "operator")
+    job = wait(client, client.post("/api/actions/approve-batch",
+                                   json={"conversation_id": "conv-12345678", "action_ids": ["a1", "a2"]},
+                                   headers=H).json()["job_id"])
+    assert job["status"] == "succeeded" and seen == {"ids": ["a1", "a2"], "stop": True}
+    login(client, "viewer")
+    assert client.post("/api/actions/approve-batch", json={"conversation_id": "c", "action_ids": ["a1"]},
+                       headers=H).status_code == 403

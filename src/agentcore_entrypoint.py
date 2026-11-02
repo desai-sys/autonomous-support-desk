@@ -25,9 +25,10 @@ from strands.models import BedrockModel
 
 import config
 from src.agents.router import DomainRouter
+from src.core.account_scope import AccountDirectory, scope_tools
 from src.core.accounts import AccountRegistry
 from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating
-from src.core.aws_clients import base_account_id, boto3, get_active_account, use_account
+from src.core.aws_clients import base_account_id, boto3, use_account
 from src.core import request_context
 from src.core.monitoring import configure_logging, metrics
 from src.core.security import Permission, ROLE_PERMISSIONS, UserRole, security_manager
@@ -588,75 +589,68 @@ def _chat(payload: dict, caller: dict) -> dict:
         return {"response": "Your organisation has reached today's request limit.",
                 "error": "RateLimited"}
 
-    targets, refused = _resolve_accounts(payload, prompt)
+    # One agent run works across accounts: every tool takes an `account` argument,
+    # resolved against the registered accounts (see src/core/account_scope.py).
+    registered = {a: info.get("name") or a for a, info in account_registry.list().items()}
+    selected, refused = _selected_accounts(payload, set(registered))
+    directory = AccountDirectory(base_account_id(), registered,
+                                 default=selected[0] if len(selected) == 1 else None, region=region)
+    refused += [a for a in directory.unregistered_ids_in(payload.get("user_message") or prompt)
+                if a not in refused]
+
     notes = _build_context_notes(artifact, region, read_only=not can_propose)
+    notes.append(directory.prompt_note())
+    if len(selected) > 1:
+        notes.append("SELECTED ACCOUNTS: the operator selected "
+                     + ", ".join(directory.label(a) for a in selected)
+                     + ". Unless they say otherwise, do the request in each of them and report per account.")
+    if refused:
+        notes.append("UNREGISTERED ACCOUNTS: " + ", ".join(refused) + " are not registered, so you "
+                     "cannot act there. Tell the operator an admin must deploy the cross-account role "
+                     "there and register it on the Accounts page.")
 
-    per_account, queued, domains_seen, max_tools = [], [], set(), 0
-    for account_id in refused:
-        per_account.append({
-            "account_id": account_id, "domain": "none", "error": "AccountNotRegistered",
-            "response": (f"Account {account_id} is not registered. An admin can add it on the "
-                         f"Accounts page after deploying the cross-account role there."),
-        })
-    for account_id in targets:
-        gate = ApprovalGate(action_store, tenant_id=caller["tenant_id"], session_id=session_id,
-                            requested_by=caller["user_id"], account_id=account_id, region=region)
-        try:
-            with use_account(account_id, region):
-                text, domains, tools = _resolve_query(
-                    prompt, payload.get("domain", "auto"), history, notes, gate,
-                    has_artifact=bool(artifact), read_only=not can_propose,
-                )
-            per_account.append({"account_id": account_id, "response": text,
-                                "domain": "+".join(domains)})
-            domains_seen.update(domains)
-            max_tools = max(max_tools, tools)
-        except Exception as e:  # one account failing shouldn't abort the rest
-            logger.exception("account_run_failed", account_id=account_id)
-            where = f"in account {account_id}" if account_id else "in the platform account"
-            per_account.append({"account_id": account_id, "domain": "unknown", "error": type(e).__name__,
-                                "response": f"The request failed {where}: {e}\n\nNothing was changed. "
-                                            f"Try again, or split the request into smaller steps."})
-        queued.extend(gate.queued)
-
-    if len(per_account) == 1:
-        response = per_account[0]["response"]
-    else:
-        response = "\n\n".join(
-            f"=== Account {r['account_id'] or 'platform'} ===\n{r['response']}" for r in per_account
+    gate = ApprovalGate(action_store, tenant_id=caller["tenant_id"], session_id=session_id,
+                        requested_by=caller["user_id"], account_id=None, region=region,
+                        directory=directory)
+    domains, tools = ["unknown"], 0
+    try:
+        response, domains, tools = _resolve_query(
+            prompt, payload.get("domain", "auto"), history, notes, gate,
+            has_artifact=bool(artifact), read_only=not can_propose, directory=directory,
         )
+    except Exception as e:
+        logger.exception("chat_run_failed")
+        response = (f"The request failed: {e}\n\nNothing was changed. Try again, or split the "
+                    f"request into smaller steps.")
 
-    for action in queued:
+    for action in gate.queued:
         security_manager.log_audit_event(
             caller["user_id"], caller["tenant_id"], "action_proposed", action["summary"], "PENDING",
             details={"action_id": action["action_id"], "account_id": action["account_id"],
                      "region": action["region"]},
         )
 
-    explicit_accounts = [a for a in targets if a] + refused
     return {
         "response": response,
-        "domain": "+".join(sorted(domains_seen)) or "unknown",
-        "tools_available": max_tools,
-        "accounts": explicit_accounts,
-        "per_account": per_account if len(per_account) > 1 else [],
-        "pending_actions": queued,
-        "escalate": "ESCALATE" in response.upper() and not queued,
+        "domain": "+".join(domains),
+        "tools_available": tools,
+        "accounts": [label for label in directory.used.values()],
+        "refused_accounts": refused,
+        "pending_actions": gate.queued,
+        "escalate": "ESCALATE" in response.upper() and not gate.queued,
     }
 
 
-def _resolve_accounts(payload: dict, prompt: str):
+def _selected_accounts(payload: dict, registered: set):
     """
-    Return (targets, refused). ``targets`` holds account ids to act on, with None
-    meaning the platform's own account; ``refused`` holds requested ids that are
-    not registered.
+    Accounts the operator picked as targets: (registered ids, unregistered ids).
 
-    Precedence: explicit "account_ids"/"accounts"/"account_id"/"account" payload
-    keys (an empty list means the platform account); otherwise 12-digit ids in
-    the latest user message. Conversation history is never scanned.
+    Reads the "account_ids"/"accounts"/"account_id"/"account" payload keys. The
+    platform account (or an empty selection) means no explicit target. Accounts
+    named in the message itself are handled by the agent through each tool's
+    `account` argument; conversation history is never scanned.
     """
     raw = []
-    explicit = any(k in payload for k in ("accounts", "account_ids", "account_id", "account"))
     for key in ("accounts", "account_ids"):
         val = payload.get(key)
         if isinstance(val, (list, tuple)):
@@ -667,24 +661,14 @@ def _resolve_accounts(payload: dict, prompt: str):
         val = payload.get(key)
         if isinstance(val, str) and val.strip():
             raw.append(val.strip())
-    if not explicit:
-        raw.extend(_ACCOUNT_ID_RE.findall(payload.get("user_message") or prompt or ""))
-
-    requested = list(dict.fromkeys(a for a in raw if _ACCOUNT_ID_RE.fullmatch(a)))
-    if not requested:
-        return [None], []
 
     base = base_account_id()
-    allowed = set(account_registry.list())
-    targets, refused = [], []
-    for account_id in requested:
+    selected, refused = [], []
+    for account_id in dict.fromkeys(a for a in raw if _ACCOUNT_ID_RE.fullmatch(a)):
         if account_id == base:
-            targets.append(None)
-        elif account_id in allowed:
-            targets.append(account_id)
-        else:
-            refused.append(account_id)
-    return list(dict.fromkeys(targets)), refused
+            continue
+        (selected if account_id in registered else refused).append(account_id)
+    return selected, refused
 
 
 def _build_context_notes(artifact, region, read_only: bool = False) -> list:
@@ -722,7 +706,8 @@ def _build_context_notes(artifact, region, read_only: bool = False) -> list:
 
 
 def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
-                   gate: ApprovalGate, has_artifact: bool = False, read_only: bool = False):
+                   gate: ApprovalGate, has_artifact: bool = False, read_only: bool = False,
+                   directory: AccountDirectory = None):
     """
     Route the prompt to 1-2 domains, run the agent, and retry once with an extra
     domain if the agent signals it lacked the right tool.
@@ -739,7 +724,7 @@ def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
         domains = domains[:1] + ["deployment"]
 
     text, final_domains, tool_count = _run_agent_with_domains(
-        prompt, domains, context_notes, gate, read_only
+        prompt, domains, context_notes, gate, read_only, directory
     )
 
     needs_retry = any(p in text.lower() for p in _MISSING_TOOL_PHRASES)
@@ -753,13 +738,14 @@ def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
         extra = [d for d in router.route(retry_prompt) if d not in tried]
         if extra:
             text, final_domains, tool_count = _run_agent_with_domains(
-                prompt, final_domains + extra[:1], context_notes, gate, read_only
+                prompt, final_domains + extra[:1], context_notes, gate, read_only, directory
             )
     return text, final_domains, tool_count
 
 
 def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
-                            gate: ApprovalGate, read_only: bool = False):
+                            gate: ApprovalGate, read_only: bool = False,
+                            directory: AccountDirectory = None):
     """Run one agent over the merged tools of ``domains``. Returns (text, domains, tool_count)."""
     seen, tools = set(), []
     for d in domains:
@@ -776,20 +762,6 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
             f"Use tools from any loaded domain as needed."
         )
 
-    active = get_active_account()
-    if active:
-        name = account_registry.name_of(active)
-        label = f"{active} ({name})" if name and name != active else active
-        system_prompt += (
-            f"\n\nACCOUNT CONTEXT: All tool calls in this turn run against AWS account {label} "
-            f"via an assumed cross-account role. State this account when you report, and do not "
-            f"claim to act on any other account."
-        )
-    else:
-        system_prompt += (
-            "\n\nACCOUNT CONTEXT: Tool calls run against the platform's own AWS account."
-        )
-
     for note in context_notes:
         system_prompt += f"\n\n{note}"
     system_prompt += (
@@ -797,6 +769,8 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
         "exactly: ESCALATE - [brief reason why]"
     )
 
+    if directory is not None:
+        tools = scope_tools(tools, directory)
     model = _BUILD_MODEL if "build" in domains else _AGENT_MODEL
     try:
         result = Agent(model=model, system_prompt=system_prompt, tools=tools,
@@ -830,11 +804,12 @@ def _execute(payload: dict, caller: dict) -> dict:
     results = execute_actions(
         action_ids, tenant_id=caller["tenant_id"], approver=caller["user_id"],
         approver_role=caller["role"].value, tools=TOOL_REGISTRY, store=action_store, audit=audit,
+        stop_on_failure=bool(payload.get("stop_on_failure")),
     )
     lines = []
     for r in results:
         metrics.action(r["status"])
-        icon = {"succeeded": "✅", "failed": "❌"}.get(r["status"], "⚠️")
+        icon = {"succeeded": "✅", "failed": "❌", "skipped": "⏭️"}.get(r["status"], "⚠️")
         where = f" in {r['account_id']}" if r.get("account_id") else ""
         detail = r.get("error") or _result_headline(r.get("result"))
         lines.append(f"{icon} {r.get('summary', r['action_id'])}{where}: {r['status']}"
