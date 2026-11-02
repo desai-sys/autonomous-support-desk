@@ -220,6 +220,8 @@ COMMON_RULES = (
     "queued as action <id>'). Then explain precisely what each queued action will do, its "
     "risk and how to roll it back. Never say a change was made unless a tool result shows it.\n"
     "- Only queue changes the operator asked for or clearly needs; one action per change.\n"
+    "- If a tool reports errors, unchecked items or an incomplete result, say so plainly and name "
+    "what could not be checked; never present a partial result as complete.\n"
     "- Always state the AWS account and region you inspected or will change.\n"
     "- Respond in plain English with short bullet points, not raw JSON.\n"
     "- Chain multiple tools when needed for full context."
