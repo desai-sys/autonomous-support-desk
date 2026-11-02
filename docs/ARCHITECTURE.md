@@ -2,6 +2,9 @@
 
 ![Architecture](architecture.png)
 
+For a narrative walkthrough of why each part exists, see [BLOG.md](BLOG.md); for how the agent is
+measured, see [EVALUATION.md](EVALUATION.md).
+
 The diagram is generated from [`architecture.py`](architecture.py). Regenerate
 it with `python docs/architecture.py`, which needs Graphviz.
 
@@ -23,8 +26,8 @@ it with `python docs/architecture.py`, which needs Graphviz.
 
 The agent follows a **router → specialist → gated tools** pattern.
 
-1. **Route.** Nova Micro picks 1–2 of seven domains, so the model sees about
-   30–60 tool schemas instead of 285. An attached code upload always adds
+1. **Route.** Nova Micro picks 1–2 of eight domains (compute, storage, network, database,
+   security, ops, deployment, build), so the model sees about 30–65 tool schemas instead of 289. An attached code upload always adds
    `deployment`. If the reply shows a needed tool was missing, the agent retries
    once with one extra domain.
 2. **Reason.** A Strands `Agent` (Nova Pro) runs with the merged tools, a
@@ -148,6 +151,7 @@ Agent runtime role (platform account)
 | `<app>-tickets` | `ticket_id` | GSI `by-tenant` (tenant_id, created_at); sparse GSI `pending-vectorization` | Escalations and their resolutions (retained on delete) |
 | `<app>-accounts` | `account_id` | — | Registered managed accounts |
 | `<app>-usage` | `tenant_id`, `period` (YYYY-MM-DD) | TTL `expires_at` | Daily request counters for the per-tenant limit |
+| `<app>-jobs` | `job_id` | TTL `expires_at` (24 h) | Console background jobs (agent turns, approvals) and their results, polled by the browser |
 
 ## Agent request contract
 
@@ -158,10 +162,11 @@ Agent runtime role (platform account)
  "prompt": "<history + message>", "user_message": "<message>", "history": [],
  "account_ids": ["111122223333"], "region": "eu-west-1",
  "artifact": {"uri": "s3://.../app.zip", "filename": "app.zip", "target": "lambda", "options": {}}}
-// → {"response", "domain", "accounts", "per_account", "pending_actions", "escalate", "tools_available", "execution_time_ms"}
+// → {"response", "domain", "accounts" (labels of accounts actually used), "refused_accounts", "pending_actions",
+//    "escalate", "tools_available", "usage" ({"input", "output"} tokens), "execution_time_ms"}
 
-// execute approved actions
-{"mode": "execute", "action_ids": ["7f3c..."], "tenant_id": "...", "user": {...}}
+// execute approved actions (in order; stop_on_failure leaves later ones pending after a failure)
+{"mode": "execute", "action_ids": ["7f3c...", "9a1e..."], "stop_on_failure": true, "tenant_id": "...", "user": {...}}
 // → {"response", "results": [{"action_id", "summary", "account_id", "region", "status", "result" | "error"}]}
 
 // admin: verify a managed account's role

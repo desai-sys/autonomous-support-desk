@@ -1,19 +1,21 @@
 {
   "enabled": true,
   "name": "Sync Docs on Source Change",
-  "description": "Watches source, config and infrastructure files and asks the agent to update README.md, AGENT_CAPABILITIES.md, docs/DEPLOYMENT.md and docs/ARCHITECTURE.md where the change affects them.",
+  "description": "Watches source, config and infrastructure files and asks the agent to update README.md, AGENT_CAPABILITIES.md and the docs/ guides where the change affects them.",
   "version": "1",
   "when": {
     "type": "fileEdited",
     "patterns": [
       "**/*.py",
       "infra/*.yaml",
-      "requirements/*.txt"
+      "requirements/*.txt",
+      "web/src/**/*.tsx",
+      "evals/*.yaml"
     ]
   },
   "then": {
     "type": "askAgent",
-    "prompt": "A source file was just edited. Review the change and update README.md, AGENT_CAPABILITIES.md, docs/DEPLOYMENT.md and docs/ARCHITECTURE.md only where they are affected (new features, changed configuration, infrastructure or behaviour). If the architecture changed, update docs/architecture.py and regenerate docs/architecture.png. Do not rewrite unrelated sections."
+    "prompt": "A source file was just edited. Review the change and update README.md, AGENT_CAPABILITIES.md, docs/DEPLOYMENT.md, docs/ARCHITECTURE.md, docs/EVALUATION.md and docs/BLOG.md only where they are affected (new features, changed configuration, infrastructure, evaluation scenarios or behaviour). If the architecture changed, update docs/architecture.py and regenerate docs/architecture.png. Keep counts (tools, tests, scenarios) accurate. Do not rewrite unrelated sections."
   },
   "workspaceFolderName": "autonomous-support-desk",
   "shortName": "sync-docs-on-source-change"

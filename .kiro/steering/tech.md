@@ -13,3 +13,4 @@
 - Deploy/update: `python scripts/deploy.py --region us-east-1 --admin-email you@example.com`
 - Local: `python agent_main.py`, `AUTH_MODE=local AGENT_ENDPOINT_URL=http://localhost:8080 uvicorn console.server:app --port 8090`, and `npm run dev` in web/ (proxies the API)
 - Diagram: `python docs/architecture.py`
+- Evaluate: `python evals/run_evals.py --region us-east-1` (Bedrock only; `--offline` validates scenarios)

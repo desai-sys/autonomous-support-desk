@@ -66,7 +66,9 @@ monitoring, updating, teardown and troubleshooting.
 | Document | Contents |
 |---|---|
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Deploying into your account, step by step |
+| [docs/BLOG.md](docs/BLOG.md) | The story: what it does, the agentic pattern, why each component exists, how it's evaluated, why it's production-ready |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, agent pattern, approval flow, cross-account model, data model, design decisions |
+| [docs/EVALUATION.md](docs/EVALUATION.md) | Safety guarantees, the scenario evaluation and its metrics, production signals |
 | [AGENT_CAPABILITIES.md](AGENT_CAPABILITIES.md) | Example requests for every tool domain |
 
 ## Repository layout
@@ -91,7 +93,8 @@ console/                   Console API server (FastAPI: Cognito sign-in, JSON AP
 web/                       Console web app (React + TypeScript + Tailwind, built into the image)
 infra/                     CloudFormation: foundation.yaml, app.yaml, cross_account_role.yaml
 scripts/                   deploy.py, destroy.py
-docs/                      Guides and the architecture diagram source
+evals/                     Agent evaluation: scenarios + harness (real models, stubbed AWS)
+docs/                      Guides, blog, evaluation, and the architecture diagram source
 tests/                     pytest suite (moto; no real AWS calls)
 ```
 
@@ -107,6 +110,10 @@ pytest -q
 
 ```bash
 cfn-lint infra/*.yaml
+```
+
+```bash
+python evals/run_evals.py --offline
 ```
 
 To run everything locally, see [Local development](docs/DEPLOYMENT.md#local-development).

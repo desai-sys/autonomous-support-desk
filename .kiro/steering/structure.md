@@ -13,7 +13,8 @@ console/                   FastAPI console server: server.py, auth.py (OIDC/dev)
 web/                       React + TypeScript + Tailwind app (pages/, components/); built into console/static
 infra/                     foundation.yaml, app.yaml, cross_account_role.yaml
 scripts/                   deploy.py, destroy.py
-docs/                      DEPLOYMENT.md, ARCHITECTURE.md, architecture.py (diagram)
+evals/                     scenarios.yaml + harness.py + run_evals.py (agent evaluation, stubbed AWS)
+docs/                      DEPLOYMENT.md, ARCHITECTURE.md, EVALUATION.md, BLOG.md, architecture.py (diagram)
 tests/                     pytest + moto; tables are created from infra/foundation.yaml
 ```
 

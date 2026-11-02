@@ -33,3 +33,4 @@ console/static/
 .vscode/
 .DS_Store
 Thumbs.db
+evals/results/

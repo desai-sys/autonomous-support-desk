@@ -32,5 +32,7 @@ jobs:
         run: cfn-lint infra/*.yaml
       - name: Run tests
         run: pytest -q
+      - name: Validate agent evaluation scenarios
+        run: python evals/run_evals.py --offline
       - name: Check the agent package builds for AgentCore (linux/arm64)
         run: python -c "import sys; sys.path.insert(0, 'scripts'); import deploy; print(len(deploy.build_agent_package()) // 1_000_000, 'MB')"
