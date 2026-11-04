@@ -13,12 +13,12 @@ at real accounts.*
 CloudOps Command Center is a chat-based operations agent for AWS. You ask it questions ("which
 S3 buckets are public?"), ask it to change things ("stop that instance", "peer these two VPCs
 across accounts"), hand it code to deploy, or describe an application for it to build. It
-investigates with **289 AWS tools** across **eight domains**, works across **many AWS
+investigates with **290 AWS tools** across **eight domains**, works across **many AWS
 accounts in a single conversation**, and **never changes anything until a person approves the
 exact call**. That rule is enforced in code, not by asking the model nicely.
 
 It deploys into your own account with one command, signs users in through Amazon Cognito, keeps
-an audit trail of every proposal and execution, and ships with a test suite (158 tests) plus a
+an audit trail of every proposal and execution, and ships with a test suite (170+ tests) plus a
 scenario evaluation harness for measuring the agent with your models.
 
 | Command Center | Approving a change |
@@ -122,7 +122,7 @@ A request's life:
 CloudOps combines several well-known agent patterns. Each one solves a specific failure mode.
 
 ### 4.1 Router → specialist (domain routing)
-Giving one model 289 tool schemas is slow, expensive and makes tool choice worse. A small, fast
+Giving one model 290 tool schemas is slow, expensive and makes tool choice worse. A small, fast
 model (Nova Micro) first classifies the request into one or two of eight domains (compute,
 storage, network, database, security, ops, deployment, build), and the reasoning model only sees
 those tools, about 30–65 at a time. Cross-service questions ("the security group of my RDS")
@@ -141,7 +141,7 @@ and region, base every statement on tool output, explain risk and rollback for c
 This is the core safety pattern, and it's **structural, not prompt-based**:
 
 - Tools whose names start with `list_`, `describe_`, `get_`, `analyze_` and the like are
-  read-only and run immediately. The other **101** tools are mutating.
+  read-only and run immediately. The other **102** tools are mutating.
 - An `ApprovalGate` hook (Strands `BeforeToolCallEvent`) intercepts every mutating call before
   it runs, stores the tool, arguments, account, region and requester as a pending action, and
   tells the model "NOT EXECUTED YET: queued as action …".
@@ -221,7 +221,7 @@ templates are policy-checked; and every proposal, approval and execution is audi
 | **Strands Agents** | Agent loop, tool definitions, hooks | Hooks (`BeforeToolCallEvent`) make the approval gate a first-class part of the loop |
 | **Amazon Nova Micro** | Domain router | Fast and cheap for a one-word classification |
 | **Amazon Nova Pro** (or `--build-model`) | Reasoning and tool use; app generation | Good tool-use quality per cost; app building can use a stronger model such as Nova Premier |
-| **289 boto3 tools** | Read and change AWS resources | Purpose-built tools encode best practice (e.g. analyse before acting); generic API tools cover the rest |
+| **290 boto3 tools** | Read and change AWS resources | Purpose-built tools encode best practice (e.g. analyse before acting); generic API tools cover the rest |
 | **DynamoDB** (actions, audit, tickets, accounts, usage, jobs) | State | Serverless and pay-per-request; conditional writes give exactly-once approvals; TTLs expire approvals, jobs and counters; point-in-time recovery |
 | **S3** (artifacts, knowledge) | Uploaded zips, agent package, app drafts, knowledge documents | Versioned, encrypted, private, lifecycle-expired uploads |
 | **Bedrock Knowledge Base on S3 Vectors** | Retrieval over past resolutions | Managed retrieval without running a vector database; tenant metadata filter |
@@ -261,7 +261,7 @@ We separate **what must never happen** from **how well it behaves**.
 [EVALUATION.md](EVALUATION.md) has the details.
 
 ### Guarantees: deterministic tests on every commit
-158 automated tests run in CI against mocked AWS (moto). The safety-critical ones drive a
+170+ automated tests run in CI against mocked AWS (moto). The safety-critical ones drive a
 **real Strands agent** with scripted, deliberately misbehaving models and check that:
 
 - a mutating tool never runs during a chat turn, even if the model calls it;
