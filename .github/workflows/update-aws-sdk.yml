@@ -25,8 +25,8 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Bump boto3/botocore and regenerate the agent lock
@@ -45,7 +45,7 @@ jobs:
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.bump.outputs.changed == 'true' && steps.existing.outputs.exists != 'true'
         with:
           node-version: "22"
