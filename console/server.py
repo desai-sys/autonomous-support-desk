@@ -4,6 +4,7 @@ CloudOps console server (FastAPI): sign-in, the JSON API, and the React app.
     uvicorn console.server:app --port 8080            # web/dist must be built (npm run build)
 """
 
+import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -16,6 +17,16 @@ from console import api, auth
 from src.core.monitoring import configure_logging
 
 configure_logging("console")
+
+if config.AUTH_MODE not in ("oidc", "local"):
+    raise RuntimeError(f"AUTH_MODE must be 'oidc' or 'local', not {config.AUTH_MODE!r}.")
+if config.AUTH_MODE == "oidc" and not (config.OIDC_CLIENT_ID and config.OIDC_METADATA_URL
+                                       and len(config.SESSION_SECRET) >= 32):
+    # Never start half-configured: without these the console could not authenticate anyone.
+    raise RuntimeError("AUTH_MODE=oidc needs OIDC_CLIENT_ID, OIDC_METADATA_URL and a session secret "
+                       "of at least 32 characters. For local development set AUTH_MODE=local.")
+# Local development: a throwaway secret per process unless one is given.
+SESSION_SECRET = config.SESSION_SECRET or secrets.token_urlsafe(48)
 
 STATIC = next((p for p in (Path(__file__).parent / "static", Path(__file__).parent.parent / "web" / "dist")
                if (p / "index.html").exists()), None)
@@ -42,7 +53,7 @@ async def security_headers(request: Request, call_next):
 
 app.add_middleware(
     SessionMiddleware,
-    secret_key=config.SESSION_SECRET,
+    secret_key=SESSION_SECRET,
     session_cookie="cloudops_session",
     max_age=12 * 3600,
     same_site="lax",
@@ -63,11 +74,12 @@ def auth_config():
 
 
 if STATIC:
-    app.mount("/assets", StaticFiles(directory=STATIC / "assets"), name="assets")
+    _static: Path = STATIC
+    app.mount("/assets", StaticFiles(directory=_static / "assets"), name="assets")
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     def spa(path: str):
-        candidate = (STATIC / path).resolve()
-        if path and candidate.is_file() and STATIC.resolve() in candidate.parents:
+        candidate = (_static / path).resolve()
+        if path and candidate.is_file() and _static.resolve() in candidate.parents:
             return FileResponse(candidate)
-        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+        return FileResponse(_static / "index.html", headers={"Cache-Control": "no-cache"})

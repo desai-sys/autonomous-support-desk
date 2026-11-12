@@ -1,6 +1,6 @@
 # CloudOps Command Center: an AI agent that runs your AWS, with you in control
 
-*How we built a production-grade operations agent on Amazon Bedrock AgentCore: the agentic
+*How we built an operations agent on Amazon Bedrock AgentCore that is designed for production: the agentic
 patterns, why each AWS component is there, how it's evaluated, and what makes it safe to point
 at real accounts.*
 
@@ -13,13 +13,14 @@ at real accounts.*
 CloudOps Command Center is a chat-based operations agent for AWS. You ask it questions ("which
 S3 buckets are public?"), ask it to change things ("stop that instance", "peer these two VPCs
 across accounts"), hand it code to deploy, or describe an application for it to build. It
-investigates with **289 AWS tools** across **eight domains**, works across **many AWS
+investigates with **288 AWS tools** across **eight domains**, works across **many AWS
 accounts in a single conversation**, and **never changes anything until a person approves the
-exact call**. That rule is enforced in code, not by asking the model nicely.
+exact call**. That rule is enforced by IAM and code, not by asking the model nicely: the part of
+the agent that talks to the model has read-only credentials.
 
 It deploys into your own account with one command, signs users in through Amazon Cognito, keeps
-an audit trail of every proposal and execution, and ships with a test suite (158 tests) plus a
-scenario evaluation harness for measuring the agent with your models.
+an audit trail of every proposal and execution, and ships with a test suite (267 tests, including
+a run of every tool) plus a scenario evaluation harness for measuring the agent with your models.
 
 | Command Center | Approving a change |
 |---|---|
@@ -104,15 +105,17 @@ A request's life:
 2. **Ask.** The React app posts the message to the FastAPI console, which starts a background
    job (agent turns can take minutes, longer than CloudFront lets a request wait) and the
    browser polls for the result.
-3. **Route.** The job invokes the agent on **Amazon Bedrock AgentCore Runtime**. A Nova Micro
-   call routes the request to one or two tool domains.
+3. **Route.** The job sends a signed request to the **planner**, one of two runtimes on
+   **Amazon Bedrock AgentCore**. A Nova Micro call routes the request to one or two tool domains.
 4. **Reason and act.** A Strands agent on Nova Pro works through the request, calling read-only
-   tools directly, in whichever accounts it names, via assumed roles with an ExternalId.
+   tools directly, in whichever accounts it names, via read-only assumed roles with an ExternalId.
+   The planner's own role is read-only too.
 5. **Propose.** Any call that would change something is intercepted and stored as a pending
    action in DynamoDB instead of running.
-6. **Approve.** The console shows approval cards. Approving runs the stored call exactly once,
-   in the stored account and region, with no model involved, and writes the result and an audit
-   record.
+6. **Approve.** The console shows approval cards. Approving sends the stored call to the
+   **executor**, a second runtime with no model and the only credentials that can change things.
+   It runs the call at most once, in the stored account and region, and writes the result and an
+   audit record.
 7. **Learn.** Escalations become tickets; resolutions flow into the knowledge base hourly.
 
 ---
@@ -122,7 +125,7 @@ A request's life:
 CloudOps combines several well-known agent patterns. Each one solves a specific failure mode.
 
 ### 4.1 Router → specialist (domain routing)
-Giving one model 289 tool schemas is slow, expensive and makes tool choice worse. A small, fast
+Giving one model 288 tool schemas is slow, expensive and makes tool choice worse. A small, fast
 model (Nova Micro) first classifies the request into one or two of eight domains (compute,
 storage, network, database, security, ops, deployment, build), and the reasoning model only sees
 those tools, about 30–65 at a time. Cross-service questions ("the security group of my RDS")
@@ -138,16 +141,23 @@ workflows ("list first, analyse before proposing changes") and shared rules (sta
 and region, base every statement on tool output, explain risk and rollback for changes).
 
 ### 4.3 Propose → approve → execute (enforced human-in-the-loop)
-This is the core safety pattern, and it's **structural, not prompt-based**:
+This is the core safety pattern, and it's **structural, not prompt-based**. Two layers enforce
+it: a hook in the agent loop, and IAM underneath it.
 
 - Tools whose names start with `list_`, `describe_`, `get_`, `analyze_` and the like are
-  read-only and run immediately. The other **101** tools are mutating.
+  read-only and run immediately. The other **102** tools are mutating.
 - An `ApprovalGate` hook (Strands `BeforeToolCallEvent`) intercepts every mutating call before
   it runs, stores the tool, arguments, account, region and requester as a pending action, and
   tells the model "NOT EXECUTED YET: queued as action …".
-- Approving re-loads the stored action, moves it `pending → executing` with a DynamoDB
-  conditional write (so it can only run once), checks the approver's role, tenant, expiry and
-  optional four-eyes rule, then **replays the stored call** with no language model involved.
+- Approving re-loads the stored action in the executor runtime, moves it `pending → executing`
+  with a DynamoDB conditional write (so it runs at most once), checks the approver's role,
+  tenant, expiry and that a second person is approving (the default), then **replays the stored
+  call** with no language model involved.
+- Underneath the hook, the planner runtime's IAM role is read-only. If the hook were bypassed
+  or a tool were mislabelled, the call would still fail.
+- The executor is denied access to the platform's own resources (users, audit trail, account
+  allow-list, secrets, runtimes), so an approved change can't be used to gain rights or erase
+  history.
 
 So even a perfectly crafted prompt injection can at most get a change *proposed*. The approval
 card shows a person exactly what would happen.
@@ -156,7 +166,8 @@ card shows a person exactly what would happen.
 sequenceDiagram
     actor Op as Operator
     participant C as Console
-    participant A as Agent (AgentCore)
+    participant A as Planner (read-only)
+    participant X as Executor
     participant D as Actions table
     participant T as Target account
     Op->>C: "stop i-0abc in prod"
@@ -165,10 +176,10 @@ sequenceDiagram
     A->>D: stop_ec2_instance queued (args, account, region)
     A-->>C: answer + pending action
     Op->>C: Approve
-    C->>A: execute(action_id)
-    A->>D: pending → executing (exactly once)
-    A->>T: stop_ec2_instance(stored args) in stored account
-    A->>D: succeeded + result (audited)
+    C->>X: execute(action_id)
+    X->>D: pending → executing (at most once)
+    X->>T: stop_ec2_instance(stored args) in stored account
+    X->>D: succeeded + result (audited)
 ```
 
 ### 4.4 One run across many accounts (per-call account scoping)
@@ -217,12 +228,12 @@ templates are policy-checked; and every proposal, approval and execution is audi
 
 | Component | Role | Why this choice |
 |---|---|---|
-| **Amazon Bedrock AgentCore Runtime** | Hosts the agent (Python 3.12, deployed straight from an S3 code package) | Managed, isolated sessions sized for agents; IAM-authorised invocation; no containers or servers to run for the agent |
+| **Amazon Bedrock AgentCore Runtime** (two: planner and executor) | Hosts the agent (Python 3.12, deployed straight from an S3 code package); one role can only read, the other runs approved changes | Managed, isolated sessions sized for agents; IAM-authorised invocation; no containers or servers to run for the agent |
 | **Strands Agents** | Agent loop, tool definitions, hooks | Hooks (`BeforeToolCallEvent`) make the approval gate a first-class part of the loop |
 | **Amazon Nova Micro** | Domain router | Fast and cheap for a one-word classification |
 | **Amazon Nova Pro** (or `--build-model`) | Reasoning and tool use; app generation | Good tool-use quality per cost; app building can use a stronger model such as Nova Premier |
-| **289 boto3 tools** | Read and change AWS resources | Purpose-built tools encode best practice (e.g. analyse before acting); generic API tools cover the rest |
-| **DynamoDB** (actions, audit, tickets, accounts, usage, jobs) | State | Serverless and pay-per-request; conditional writes give exactly-once approvals; TTLs expire approvals, jobs and counters; point-in-time recovery |
+| **288 boto3 tools** | Read and change AWS resources | Purpose-built tools encode best practice (e.g. analyse before acting); generic API tools cover the rest |
+| **DynamoDB** (actions, audit, tickets, accounts, usage, jobs, conversations) | State | Serverless and pay-per-request; conditional writes make approvals run at most once; TTLs expire approvals, jobs and counters; point-in-time recovery |
 | **S3** (artifacts, knowledge) | Uploaded zips, agent package, app drafts, knowledge documents | Versioned, encrypted, private, lifecycle-expired uploads |
 | **Bedrock Knowledge Base on S3 Vectors** | Retrieval over past resolutions | Managed retrieval without running a vector database; tenant metadata filter |
 | **Amazon Cognito** | Sign-in, MFA, groups as roles | Hosted, standards-based (OIDC); tenant attribute users can't edit |
@@ -240,13 +251,17 @@ templates are policy-checked; and every proposal, approval and execution is audi
 
 ## 6. Security model
 
-- **No autonomous changes.** Mutating calls queue; approvals replay stored calls exactly once.
+- **No autonomous changes.** The model's runtime is read-only; mutating calls queue; approvals
+  replay stored calls at most once in a separate runtime; a second person approves by default.
+- **Verified callers.** The console signs every request; the agent rejects unsigned or altered ones.
+- **The platform protects itself.** The executor can't touch the platform's users, audit trail,
+  allow-list, secrets or runtimes.
 - **Least privilege by role.** Viewers are read-only; approvers need the right role and tenant;
   an optional rule requires a different approver than the requester.
 - **Cross-account by allow-list.** Only registered accounts, via roles that require an
   ExternalId.
-- **Network.** HTTPS ends at CloudFront with WAF; the ALB accepts only CloudFront's address range
-  plus a secret header; console tasks run in private subnets.
+- **Network.** HTTPS ends at CloudFront with WAF; the load balancer is internal, reached through
+  a CloudFront VPC origin, and requires a secret header; console tasks run in private subnets.
 - **Sessions.** Signed, HTTP-only cookies; CSRF blocked by SameSite plus a required header.
 - **Data.** Encrypted, private buckets with TLS-only policies; tenant-scoped tickets, drafts and
   knowledge; audit and tickets retained even if the stack is deleted.
@@ -261,11 +276,15 @@ We separate **what must never happen** from **how well it behaves**.
 [EVALUATION.md](EVALUATION.md) has the details.
 
 ### Guarantees: deterministic tests on every commit
-158 automated tests run in CI against mocked AWS (moto). The safety-critical ones drive a
+267 automated tests run in CI against mocked AWS (moto), covering 70% of the application code. The safety-critical ones drive a
 **real Strands agent** with scripted, deliberately misbehaving models and check that:
 
 - a mutating tool never runs during a chat turn, even if the model calls it;
-- an approved action runs exactly once, with the stored arguments, in the stored account;
+- an approved action runs at most once, with the stored arguments, in the stored account;
+- the planner's role is read-only and each runtime refuses the other's requests;
+- unsigned, altered or stale requests are rejected;
+- open-ended reads can't have side effects or return secrets;
+- every one of the 288 tools runs without a programming error or an invalid API parameter;
 - viewers, wrong tenants, expired or rejected actions never execute;
 - if the approval store is down, nothing runs (fail closed);
 - unknown accounts are refused, and dependent cross-account steps stop at the first failure;
@@ -307,33 +326,45 @@ best sources of new evaluation scenarios.
 
 ---
 
-## 8. Why it's production-ready
+## 8. What makes it fit for production, and what is still unproven
 
 | Concern | How it's handled |
 |---|---|
-| Safety | Enforced approvals, exactly-once execution, role and tenant checks, fail-closed gate |
-| Deployability | Two CloudFormation stacks and one idempotent command; no local Docker |
-| Multi-account | Allow-listed accounts, ExternalId roles, deployable as a StackSet across an organisation |
-| Identity | Cognito OIDC with MFA, roles from groups, tenant isolation |
-| Reliability | Stateless console behind an ALB with auto scaling and automatic rollback; background jobs survive task restarts |
+| Safety | Read-only planner, separate executor, enforced approvals by a second person, at-most-once execution, signed requests, platform self-protection, fail-closed gate |
+| Deployability | Two CloudFormation stacks and one idempotent command, or a GitHub pipeline with staging, an evaluation gate and an approval before production; no local Docker |
+| Multi-account | Per-tenant allow-lists, a read role and a change role per account with ExternalIds, deployable as a StackSet across an organisation |
+| Identity | Cognito OIDC with MFA, roles from groups, tenants that only reach their own accounts and records |
+| Reliability | Stateless console behind a private load balancer with auto scaling and automatic rollback; a NAT gateway per zone; lost jobs are detected and settled; interrupted actions are flagged, never retried |
+| Truthfulness | Complete listings through automatic pagination, with a stated cap; conversation memory built from recorded tool results |
 | Observability | JSON logs, EMF metrics, dashboard, alarms to email, a per-tenant audit trail |
 | Cost control | Per-tenant daily limits, token metrics, serverless data stores, ARM64 compute |
-| Maintainability | CI on every change, weekly AWS SDK updates, Dependabot, scenario evaluation |
-| Data protection | Encryption, private buckets, retained audit and tickets, point-in-time recovery |
+| Maintainability | CI with tests, lint and security rules, type checks, dependency audits and CodeQL; weekly AWS SDK updates; Dependabot |
+| Data protection | Encryption, private buckets, retained audit and tickets, point-in-time recovery, secrets fetched at run time and redacted from results and memory |
+
+**What is still unproven.** These controls are tested against simulated AWS, not yet exercised
+in a live account after the planner/executor split, and the agent's behaviour with real models
+has not been measured. Until both are done, treat it as a strong candidate for production, not
+as proven in it.
 
 ---
 
 ## 9. Limitations and what's next
 
+- **No behavioural baseline yet.** Run the evaluation in your account to set one; the deploy
+  pipeline uses it as a release gate.
+- **Not yet proven live in its current form.** The first deployment of this version should go
+  to a staging environment.
 - **Model capability.** With Nova Pro, small apps and routine operations work well; complex
-  generated applications benefit from a stronger build model. The evaluation harness is how you
-  decide.
+  generated applications benefit from a stronger build model.
+- **Tools are smoke-tested, not verified.** Every tool runs cleanly against simulated AWS;
+  only some have their answers checked.
+- **Tenant isolation is logical**, suited to teams of one organisation rather than mutually
+  hostile customers. CloudFront to the load balancer is private but not TLS without a custom
+  domain.
 - **Generated apps use only the standard library and the AWS SDK**, because dependency packaging
   isn't built yet.
-- **No behavioural baseline yet.** Run the evaluation in your account to set one.
-- **Single region per deployment** (the agent can still act in any region you ask for).
-- **Next:** templated blueprints for common app shapes, a check-and-fix loop before the approval
-  card, scheduled evaluation runs with trend tracking, and an LLM-as-judge for answer quality.
+- **Next:** a queue-backed worker for jobs, plan-then-approve for dependent steps, end-to-end TLS
+  with a custom domain, an LLM-as-judge for answer quality, and more one-approval workflows.
 
 ---
 

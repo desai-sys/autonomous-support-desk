@@ -6,7 +6,6 @@ Complements compute_tools, storage_tools, network_tools, database_tools, securit
 from src.core.aws_clients import boto3  # account-aware boto3 shim (cross-account support)
 import json
 from datetime import datetime, timedelta
-from typing import List, Optional
 from strands import tool
 
 
@@ -287,7 +286,7 @@ def analyze_sqs_queue(queue_url: str) -> str:
             'redrive_policy': json.loads(a['RedrivePolicy']) if 'RedrivePolicy' in a else None,
             'created': datetime.fromtimestamp(int(a.get('CreatedTimestamp', 0))).isoformat(),
         }
-        return f"SQS Queue Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "SQS Queue Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing SQS queue: {str(e)}"
 
@@ -320,7 +319,7 @@ def get_sqs_queue_attributes(queue_url: str) -> str:
     try:
         sqs = boto3.client('sqs', region_name='us-east-1')
         response = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=['All'])
-        return f"SQS Queue Attributes:\n" + json.dumps(response['Attributes'], indent=2)
+        return "SQS Queue Attributes:\n" + json.dumps(response['Attributes'], indent=2)
     except Exception as e:
         return f"Error getting SQS queue attributes: {str(e)}"
 
@@ -772,7 +771,7 @@ def analyze_state_machine(state_machine_arn: str) -> str:
             'tracing_enabled': sm.get('tracingConfiguration', {}).get('enabled', False),
             'recent_executions': recent,
         }
-        return f"State Machine Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "State Machine Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing state machine: {str(e)}"
 
@@ -1044,7 +1043,7 @@ def get_cost_forecast(days_ahead: int = 30, granularity: str = 'MONTHLY') -> str
                                    'upper_bound': round(float(r.get('PredictionIntervalUpperBound', 0)), 2)}
                                   for r in response.get('ForecastResultsByTime', [])],
         }
-        return f"Cost Forecast:\n" + json.dumps(result, indent=2)
+        return "Cost Forecast:\n" + json.dumps(result, indent=2)
     except Exception as e:
         return f"Error getting cost forecast: {str(e)}"
 
@@ -1156,7 +1155,7 @@ def get_backup_job_status(job_id: str) -> str:
             'completion_date': response.get('CompletionDate', '').isoformat() if response.get('CompletionDate') else None,
             'percent_done': response.get('PercentDone', '0'),
         }
-        return f"Backup Job Status:\n" + json.dumps(result, indent=2, default=str)
+        return "Backup Job Status:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting backup job status: {str(e)}"
 
@@ -1250,7 +1249,7 @@ def get_glue_job_run(job_name: str, run_id: str) -> str:
             'error': r.get('ErrorMessage', ''),
             'log_group': r.get('LogGroupName', ''),
         }
-        return f"Glue Job Run Details:\n" + json.dumps(result, indent=2, default=str)
+        return "Glue Job Run Details:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting Glue job run: {str(e)}"
 
@@ -1407,7 +1406,7 @@ def analyze_opensearch_serverless_collection(collection_id: str, region: str = '
             'last_modified': c.get('lastModifiedDate', 0),
             'arn': c.get('arn', 'N/A'),
         }
-        return f"OpenSearch Serverless Collection Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "OpenSearch Serverless Collection Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing OpenSearch Serverless collection: {str(e)}"
 
@@ -1521,7 +1520,7 @@ def analyze_msk_cluster(cluster_arn: str) -> str:
             'enhanced_monitoring': c.get('EnhancedMonitoring', 'DEFAULT'),
             'created': c['CreationTime'].isoformat(),
         }
-        return f"MSK Cluster Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "MSK Cluster Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing MSK cluster: {str(e)}"
 
@@ -1695,7 +1694,7 @@ def get_ses_sending_stats(region: str = 'us-east-1') -> str:
                                     'sent': dp.get('DeliveryAttempts', 0),
                                     'bounces': dp.get('Bounces', 0)} for dp in datapoints[-7:]],
         }
-        return f"SES Sending Statistics:\n" + json.dumps(result, indent=2, default=str)
+        return "SES Sending Statistics:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting SES sending stats: {str(e)}"
 
@@ -1733,7 +1732,7 @@ def check_ses_sending_quota(region: str = 'us-east-1') -> str:
             'remaining_quota': response['Max24HourSend'] - response['SentLast24Hours'],
             'utilization_pct': round(response['SentLast24Hours'] / max(response['Max24HourSend'], 1) * 100, 2),
         }
-        return f"SES Sending Quota:\n" + json.dumps(result, indent=2)
+        return "SES Sending Quota:\n" + json.dumps(result, indent=2)
     except Exception as e:
         return f"Error checking SES sending quota: {str(e)}"
 
@@ -1859,7 +1858,7 @@ def get_config_compliance_summary(region: str = 'us-east-1') -> str:
             'non_compliant_rules': summary.get('NonCompliantResourceCount', {}).get('CappedCount', 0),
             'compliance_time': summary.get('ComplianceSummaryTimestamp', '').isoformat() if summary.get('ComplianceSummaryTimestamp') else None,
         }
-        return f"AWS Config Compliance Summary:\n" + json.dumps(result, indent=2, default=str)
+        return "AWS Config Compliance Summary:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting Config compliance summary: {str(e)}"
 
@@ -1919,7 +1918,7 @@ def get_trusted_advisor_check_result(check_id: str, language: str = 'en') -> str
         support = boto3.client('support', region_name='us-east-1')
         response = support.describe_trusted_advisor_check_result(checkId=check_id, language=language)
         result = response['result']
-        summary = result.get('categorySpecificSummary', {})
+        result.get('categorySpecificSummary', {})
         check_result = {
             'check_id': check_id,
             'status': result['status'],
@@ -1927,7 +1926,7 @@ def get_trusted_advisor_check_result(check_id: str, language: str = 'en') -> str
             'resources_summary': result.get('resourcesSummary', {}),
             'flagged_resources': result.get('flaggedResources', [])[:10],
         }
-        return f"Trusted Advisor Check Result:\n" + json.dumps(check_result, indent=2, default=str)
+        return "Trusted Advisor Check Result:\n" + json.dumps(check_result, indent=2, default=str)
     except Exception as e:
         return f"Error getting Trusted Advisor check result: {str(e)}"
 
@@ -2168,48 +2167,6 @@ def list_timestream_tables(database_name: str, region: str = 'us-east-1') -> str
 
 
 # ============================================================================
-# QLDB Tools
-# ============================================================================
-
-@tool
-def list_qldb_ledgers(region: str = 'us-east-1') -> str:
-    """List all QLDB ledgers."""
-    try:
-        qldb = boto3.client('qldb', region_name=region)
-        response = qldb.list_ledgers()
-        ledgers = []
-        for l in response['Ledgers']:
-            ledgers.append({
-                'name': l['Name'],
-                'state': l['State'],
-                'created': l['CreationDateTime'].isoformat(),
-            })
-        return f"Found {len(ledgers)} QLDB ledger(s):\n" + json.dumps(ledgers, indent=2, default=str)
-    except Exception as e:
-        return f"Error listing QLDB ledgers: {str(e)}"
-
-
-@tool
-def analyze_qldb_ledger(ledger_name: str) -> str:
-    """Analyze a QLDB ledger including permissions mode and export configuration."""
-    try:
-        qldb = boto3.client('qldb', region_name='us-east-1')
-        response = qldb.describe_ledger(Name=ledger_name)
-        analysis = {
-            'name': ledger_name,
-            'arn': response['Arn'],
-            'state': response['State'],
-            'permissions_mode': response['PermissionsMode'],
-            'deletion_protection': response.get('DeletionProtection', True),
-            'encryption_description': response.get('EncryptionDescription', {}),
-            'created': response['CreationDateTime'].isoformat(),
-        }
-        return f"QLDB Ledger Analysis for {ledger_name}:\n" + json.dumps(analysis, indent=2, default=str)
-    except Exception as e:
-        return f"Error analyzing QLDB ledger: {str(e)}"
-
-
-# ============================================================================
 # DMS (Database Migration Service) Tools
 # ============================================================================
 
@@ -2259,7 +2216,7 @@ def analyze_dms_task(task_arn: str) -> str:
             'start_date': t.get('ReplicationTaskStartDate', '').isoformat() if t.get('ReplicationTaskStartDate') else None,
             'stop_reason': t.get('StopReason', ''),
         }
-        return f"DMS Task Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "DMS Task Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing DMS task: {str(e)}"
 
@@ -2375,7 +2332,7 @@ def analyze_datasync_task(task_arn: str) -> str:
             'options': task.get('Options', {}),
             'created': task['CreationTime'].isoformat(),
         }
-        return f"DataSync Task Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "DataSync Task Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing DataSync task: {str(e)}"
 
@@ -2426,7 +2383,7 @@ def get_shield_protection_status() -> str:
             'auto_renew': subscription.get('AutoRenew', 'DISABLED'),
             'proactive_engagement_status': subscription.get('ProactiveEngagementStatus', 'N/A'),
         }
-        return f"AWS Shield Subscription Status:\n" + json.dumps(result, indent=2, default=str)
+        return "AWS Shield Subscription Status:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting Shield protection status: {str(e)}"
 
@@ -2466,7 +2423,7 @@ def get_macie_status() -> str:
             'updated': response['updatedAt'].isoformat(),
             'finding_publishing_frequency': response.get('findingPublishingFrequency', 'N/A'),
         }
-        return f"Amazon Macie Status:\n" + json.dumps(result, indent=2, default=str)
+        return "Amazon Macie Status:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting Macie status: {str(e)}"
 
@@ -2542,7 +2499,7 @@ def get_inspector_coverage(region: str = 'us-east-1') -> str:
             'total_covered_resources': response.get('totalCounts', 0),
             'coverage_by_group': [{'group_key': g['groupKey'], 'count': g['counts']} for g in counts],
         }
-        return f"Inspector Coverage Summary:\n" + json.dumps(result, indent=2, default=str)
+        return "Inspector Coverage Summary:\n" + json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error getting Inspector coverage: {str(e)}"
 
@@ -2594,7 +2551,7 @@ def get_security_hub_summary(region: str = 'us-east-1') -> str:
             )
             # Use list_findings_v2 count if available, else approximate
             summary[sev] = len(response['Findings'])
-        return f"Security Hub Findings Summary (active):\n" + json.dumps(summary, indent=2)
+        return "Security Hub Findings Summary (active):\n" + json.dumps(summary, indent=2)
     except Exception as e:
         return f"Error getting Security Hub summary: {str(e)}"
 
@@ -3026,7 +2983,10 @@ def analyze_batch_job_queue(job_queue_name: str) -> str:
     """Analyze a Batch job queue including pending, running, and failed job counts."""
     try:
         batch = boto3.client('batch', region_name='us-east-1')
-        queue = batch.describe_job_queues(jobQueues=[job_queue_name])['jobQueues'][0]
+        queues = batch.describe_job_queues(jobQueues=[job_queue_name])['jobQueues']
+        if not queues:
+            return f"Batch job queue '{job_queue_name}' not found."
+        queue = queues[0]
         job_counts = {}
         for status in ['SUBMITTED', 'PENDING', 'RUNNABLE', 'STARTING', 'RUNNING', 'SUCCEEDED', 'FAILED']:
             jobs = batch.list_jobs(jobQueue=job_queue_name, jobStatus=status)
@@ -3580,7 +3540,7 @@ def analyze_apprunner_service(service_arn: str) -> str:
             'created': s['CreatedAt'].isoformat(),
             'updated': s['UpdatedAt'].isoformat(),
         }
-        return f"App Runner Service Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "App Runner Service Analysis:\n" + json.dumps(analysis, indent=2, default=str)
     except Exception as e:
         return f"Error analyzing App Runner service: {str(e)}"
 
@@ -3718,7 +3678,7 @@ DATABASE
   • Manage ElastiCache and DocumentDB clusters
   • Manage Redshift clusters (pause/resume)
   • Manage Neptune, OpenSearch Service, OpenSearch Serverless
-  • Manage Glue ETL jobs, Athena queries, Timestream, QLDB
+  • Manage Glue ETL jobs, Athena queries, Timestream
   • Manage DMS migration tasks
 
 SECURITY

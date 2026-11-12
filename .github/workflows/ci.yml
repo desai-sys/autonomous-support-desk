@@ -30,8 +30,21 @@ jobs:
         run: pip install -r requirements/dev.txt
       - name: Lint CloudFormation
         run: cfn-lint infra/*.yaml
-      - name: Run tests
-        run: pytest -q
+      - name: Lint Python (correctness and security rules)
+        run: ruff check .
+      - name: Type-check the platform core
+        run: mypy src/core console src/agents src/services src/jobs config.py
+      - name: Audit Python dependencies for known vulnerabilities
+        run: |
+          pip-audit -r requirements/agent.lock.txt --no-deps --disable-pip
+          pip-audit -r requirements/console.txt --no-deps --disable-pip
+      - name: Audit web dependencies shipped to the browser
+        working-directory: web
+        run: npm audit --omit=dev --audit-level=high
+      - name: Run tests with coverage
+        run: |
+          coverage run --source=src,console -m pytest -q
+          coverage report --fail-under=65 | tail -1
       - name: Validate agent evaluation scenarios
         run: python evals/run_evals.py --offline
       - name: Check the agent package builds for AgentCore (linux/arm64)

@@ -27,7 +27,9 @@ import config
 from src.agents.router import DomainRouter
 from src.core.account_scope import AccountDirectory, scope_tools
 from src.core.accounts import AccountRegistry
-from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating
+from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating, describe_results
+from src.core import conversations, identity, tenancy
+from src.core.conversations import ConversationStore, ToolRecorder
 from src.core.aws_clients import base_account_id, boto3, use_account
 from src.core import request_context
 from src.core.monitoring import configure_logging, metrics
@@ -96,18 +98,16 @@ from src.tools.aws_tools import (
     list_cloudwatch_alarms, create_cloudwatch_alarm, get_cloudwatch_metrics,
     list_log_groups, get_log_events, create_log_metric_filter,
     list_sns_topics, create_sns_topic, publish_sns_message,
-    list_sns_subscriptions, subscribe_sns_topic,
+    subscribe_sns_topic,
     list_sqs_queues, analyze_sqs_queue, purge_sqs_queue,
-    send_sqs_message, get_sqs_queue_attributes,
-    list_api_gateways, analyze_api_gateway, create_api_gateway_deployment,
+    send_sqs_message, list_api_gateways, analyze_api_gateway, create_api_gateway_deployment,
     get_api_gateway_stages,
     list_cloudformation_stacks, analyze_cloudformation_stack,
     get_stack_events, detect_stack_drift,
     list_pipelines, get_pipeline_state, retry_pipeline_stage, start_pipeline_execution,
     list_ecr_repositories, analyze_ecr_repository, get_ecr_image_scan_results,
     delete_ecr_images,
-    list_kinesis_streams, analyze_kinesis_stream, get_kinesis_shard_iterator,
-    list_state_machines, analyze_state_machine,
+    list_kinesis_streams, analyze_kinesis_stream, list_state_machines, analyze_state_machine,
     start_state_machine_execution, stop_state_machine_execution,
     list_event_buses, list_event_rules, enable_event_rule,
     disable_event_rule, put_event,
@@ -133,7 +133,6 @@ from src.tools.aws_tools import (
     pause_redshift_cluster, resume_redshift_cluster,
     list_neptune_clusters, analyze_neptune_cluster,
     list_timestream_databases, list_timestream_tables,
-    list_qldb_ledgers, analyze_qldb_ledger,
     list_dms_tasks, analyze_dms_task, start_dms_task, stop_dms_task,
     list_transfer_servers, analyze_transfer_server,
     list_datasync_tasks, analyze_datasync_task, start_datasync_task,
@@ -255,7 +254,7 @@ DOMAIN_INTROS = {
     ),
     "database": (
         "You are an AWS Database specialist. You manage RDS, DynamoDB, ElastiCache, DocumentDB, "
-        "Redshift, Neptune, OpenSearch, Glue, Athena, Timestream, QLDB, and DMS. Use list_ tools "
+        "Redshift, Neptune, OpenSearch, Glue, Athena, Timestream, and DMS. Use list_ tools "
         "first; mention backup status and storage encryption when analyzing databases."
     ),
     "security": (
@@ -404,7 +403,6 @@ TOOLS_DATABASE = [
     list_glue_jobs, analyze_glue_job, start_glue_job, stop_glue_job, get_glue_job_run,
     list_athena_workgroups, start_athena_query, get_athena_query_results,
     list_timestream_databases, list_timestream_tables,
-    list_qldb_ledgers, analyze_qldb_ledger,
     list_dms_tasks, analyze_dms_task, start_dms_task, stop_dms_task,
     search_resource_by_name,
     describe_agent_capabilities,
@@ -510,9 +508,12 @@ TOOL_REGISTRY = {t.tool_name: t for group in DOMAIN_TOOLS.values() for t in grou
 
 router = DomainRouter(region=config.AWS_REGION)
 action_store = ActionStore()
+conversation_store = ConversationStore()
 account_registry = AccountRegistry()
 
 _ACCOUNT_ID_RE = re.compile(r"\b(\d{12})\b")
+# Viewers get the purpose-built read tools only, not open-ended API access.
+_NOT_FOR_VIEWERS = frozenset({"query_aws_api"})
 _MISSING_TOOL_PHRASES = (
     "don't have a tool", "not available in the current tools", "cannot find a tool",
     "i don't have the capability", "not covered by my tools", "no appropriate tool", "escalate",
@@ -541,6 +542,12 @@ def invoke(payload: dict) -> dict:
           "action_ids": [...]
         }
     """
+    try:
+        identity.verify(payload)
+    except identity.IdentityError as e:
+        logger.warning("request_rejected", reason=str(e))
+        return {"response": f"Request rejected: {e}", "error": "Unauthorized",
+                "session_id": payload.get("session_id", "")}
     caller = _caller(payload)
     structlog.contextvars.bind_contextvars(
         tenant_id=caller["tenant_id"], user_id=caller["user_id"],
@@ -564,6 +571,13 @@ def invoke(payload: dict) -> dict:
 
 
 def _dispatch(mode: str, payload: dict, caller: dict) -> dict:
+    # The planner runtime (model, read-only credentials) never executes changes and
+    # the executor runtime (write credentials) never runs a model.
+    allowed = {"planner": ("chat", "check_account"), "executor": ("execute", "check_account")}.get(
+        config.RUNTIME_MODE, ("chat", "execute", "check_account"))
+    if mode in ("chat", "execute", "check_account") and mode not in allowed:
+        return {"response": f"This runtime ({config.RUNTIME_MODE}) does not handle '{mode}' requests.",
+                "error": "WrongRuntime"}
     if mode == "execute":
         return _execute(payload, caller)
     if mode == "check_account":
@@ -606,10 +620,12 @@ def _chat(payload: dict, caller: dict) -> dict:
 
     # One agent run works across accounts: every tool takes an `account` argument,
     # resolved against the registered accounts (see src/core/account_scope.py).
-    registered = {a: info.get("name") or a for a, info in account_registry.list().items()}
+    registered = {a: info.get("name") or a
+                  for a, info in account_registry.list(caller["tenant_id"]).items()}
     selected, refused = _selected_accounts(payload, set(registered))
     directory = AccountDirectory(base_account_id(), registered,
-                                 default=selected[0] if len(selected) == 1 else None, region=region)
+                                 default=selected[0] if len(selected) == 1 else None, region=region,
+                                 platform_allowed=tenancy.platform_allowed(caller["tenant_id"]))
     refused += [a for a in directory.unregistered_ids_in(payload.get("user_message") or prompt)
                 if a not in refused]
 
@@ -627,17 +643,30 @@ def _chat(payload: dict, caller: dict) -> dict:
     gate = ApprovalGate(action_store, tenant_id=caller["tenant_id"], session_id=session_id,
                         requested_by=caller["user_id"], account_id=None, region=region,
                         directory=directory)
+    # Earlier turns come from the platform's own records (with tool results and what
+    # approved actions returned), not from the text the browser sent, when available.
+    user_message = payload.get("user_message") or prompt
+    records = conversation_store.recent(caller["tenant_id"], payload.get("session_id", ""))
+    remembered = conversations.render(records)
+    if remembered:
+        prompt = f"{remembered}\n\nUser: {user_message}"
+        history = conversations.history_lines(records)
+    recorder = ToolRecorder()
+    gate.companions = [recorder]            # hooks that run alongside the gate in this turn
     domains, tools = ["unknown"], 0
     try:
         response, domains, tools = _resolve_query(
             prompt, payload.get("domain", "auto"), history, notes, gate,
             has_artifact=bool(artifact), read_only=not can_propose, directory=directory,
+            route_text=user_message if remembered else None,
         )
     except Exception as e:
         logger.exception("chat_run_failed")
         response = (f"The request failed: {e}\n\nNothing was changed. Try again, or split the "
                     f"request into smaller steps.")
 
+    conversation_store.record_turn(caller["tenant_id"], payload.get("session_id", ""), user_message,
+                                   response, recorder.calls, gate.queued)
     for action in gate.queued:
         security_manager.log_audit_event(
             caller["user_id"], caller["tenant_id"], "action_proposed", action["summary"], "PENDING",
@@ -723,7 +752,7 @@ def _build_context_notes(artifact, region, read_only: bool = False) -> list:
 
 def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
                    gate: ApprovalGate, has_artifact: bool = False, read_only: bool = False,
-                   directory: AccountDirectory = None):
+                   directory: AccountDirectory = None, route_text: str = None):
     """
     Route the prompt to 1-2 domains, run the agent, and retry once with an extra
     domain if the agent signals it lacked the right tool.
@@ -731,7 +760,7 @@ def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
     Returns (response_text, domains_used, tool_count).
     """
     if domain == "auto" or domain not in DOMAIN_TOOLS:
-        domains = router.route(prompt, history)
+        domains = router.route(route_text or prompt, history)
     else:
         domains = [domain]
 
@@ -766,7 +795,8 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
     seen, tools = set(), []
     for d in domains:
         for tool_fn in DOMAIN_TOOLS.get(d, []):
-            if id(tool_fn) in seen or (read_only and is_mutating(tool_fn.tool_name)):
+            if id(tool_fn) in seen or (read_only and (is_mutating(tool_fn.tool_name)
+                                                      or tool_fn.tool_name in _NOT_FOR_VIEWERS)):
                 continue
             seen.add(id(tool_fn))
             tools.append(tool_fn)
@@ -788,16 +818,17 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
     if directory is not None:
         tools = scope_tools(tools, directory)
     model = _BUILD_MODEL if "build" in domains else _AGENT_MODEL
+    hooks = [h for h in [gate, *getattr(gate, "companions", [])] if h is not None]
     try:
         result = Agent(model=model, system_prompt=system_prompt, tools=tools,
-                       hooks=[gate], callback_handler=None)(prompt)
+                       hooks=hooks, callback_handler=None)(prompt)
     except Exception as e:
         # Models occasionally emit a malformed tool call when its input is large. Retry once
         # with a fresh agent and a nudge towards smaller calls.
         if "ToolUse" not in str(e) and "invalid sequence" not in str(e):
             raise
         logger.warning("tool_use_stream_error_retry", error=str(e))
-        result = Agent(model=model, tools=tools, hooks=[gate], callback_handler=None,
+        result = Agent(model=model, tools=tools, hooks=hooks, callback_handler=None,
                        system_prompt=system_prompt + (
                            "\n\nYour previous attempt failed because a tool call was malformed. "
                            "Keep every tool call small: one file per call, plain text content."))(prompt)
@@ -824,20 +855,23 @@ def _execute(payload: dict, caller: dict) -> dict:
     def audit(**kwargs):
         security_manager.log_audit_event(caller["user_id"], caller["tenant_id"], **kwargs)
 
+    # The account must still be this tenant's when the change runs, not only when it was proposed.
+    registered = set(account_registry.list(caller["tenant_id"]))
+
+    def account_allowed(account_id) -> bool:
+        return account_id in registered if account_id else tenancy.platform_allowed(caller["tenant_id"])
+
     results = execute_actions(
         action_ids, tenant_id=caller["tenant_id"], approver=caller["user_id"],
         approver_role=caller["role"].value, tools=TOOL_REGISTRY, store=action_store, audit=audit,
-        stop_on_failure=bool(payload.get("stop_on_failure")),
+        stop_on_failure=bool(payload.get("stop_on_failure")), account_allowed=account_allowed,
     )
-    lines = []
     for r in results:
         metrics.action(r["status"])
-        icon = {"succeeded": "✅", "failed": "❌", "skipped": "⏭️"}.get(r["status"], "⚠️")
-        where = f" in {_account_name(r.get('account_id'))}"
-        detail = r.get("error") or _result_headline(r.get("result"))
-        lines.append(f"{icon} {r.get('summary', r['action_id'])}{where}: {r['status']}"
-                     + (f" — {detail}" if detail else ""))
-    return {"response": "\n".join(lines), "results": results}
+    conversation_store.record_execution(caller["tenant_id"], payload.get("session_id", ""),
+                                        caller["user_id"], results)
+    return {"response": describe_results(results, lambda a: _account_name(a, caller["tenant_id"])),
+            "results": results}
 
 
 def _check_account(payload: dict, caller: dict) -> dict:
@@ -847,6 +881,8 @@ def _check_account(payload: dict, caller: dict) -> dict:
     account_id = str(payload.get("account_id", ""))
     if not _ACCOUNT_ID_RE.fullmatch(account_id):
         return {"ok": False, "response": "Invalid account id.", "error": "BadRequest"}
+    if not account_registry.is_allowed(account_id, caller["tenant_id"]):
+        return {"ok": False, "response": "Register the account before testing it.", "error": "BadRequest"}
     try:
         with use_account(account_id):
             arn = boto3.client("sts").get_caller_identity()["Arn"]
@@ -856,31 +892,14 @@ def _check_account(payload: dict, caller: dict) -> dict:
                                          f"{account_id}: {e}"}
 
 
-def _account_name(account_id) -> str:
+def _account_name(account_id, tenant_id=None) -> str:
     if not account_id:
         return "the platform account"
     try:
-        name = account_registry.name_of(account_id)
+        name = account_registry.name_of(account_id, tenant_id)
     except Exception:
         name = None
     return f"{name} ({account_id})" if name and name != account_id else account_id
-
-
-def _result_headline(result) -> str:
-    """One-line summary of a tool result (deployment manifests and error JSON)."""
-    if not result:
-        return ""
-    try:
-        data = json.loads(result)
-    except (TypeError, ValueError):
-        return str(result)[:300]
-    if not isinstance(data, dict):
-        return str(result)[:300]
-    if data.get("error_message"):
-        return data["error_message"][:300]
-    if data.get("resource_arn"):
-        return data["resource_arn"]
-    return str(data.get("message") or "")[:300]
 
 
 if __name__ == "__main__":

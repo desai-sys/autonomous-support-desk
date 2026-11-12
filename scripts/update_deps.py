@@ -32,7 +32,7 @@ AGENT_LOCK = ROOT / "requirements/agent.lock.txt"
 
 def latest_sdk_versions(fetch=None) -> dict:
     """{"boto3": x, "botocore": y} for the newest boto3 release and the botocore it requires."""
-    fetch = fetch or (lambda url: json.load(urllib.request.urlopen(url, timeout=30)))
+    fetch = fetch or (lambda url: json.load(urllib.request.urlopen(url, timeout=30)))  # noqa: S310 - fixed https URL
     info = fetch("https://pypi.org/pypi/boto3/json")["info"]
     botocore = next((m.group(1) for req in info.get("requires_dist") or []
                      if (m := re.match(r"botocore\s*.*?>=\s*([0-9][0-9.]*)", req))), None)

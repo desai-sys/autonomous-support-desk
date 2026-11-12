@@ -7,10 +7,11 @@ records the exact tool name, arguments, target account and region as a pending
 action in DynamoDB, and returns "queued for approval" to the model instead of
 executing. The console shows each pending action with an Approve / Reject
 button. Approving calls :func:`execute_actions`, which re-loads the stored
-action, atomically moves it to ``executing`` (so it can only run once), and
+action, atomically moves it to ``executing`` (so it runs at most once), and
 invokes the tool with the stored arguments under the stored account context —
 no LLM is involved in the execution step, so what was approved is exactly what
-runs.
+runs. If the executor stops mid-run the action is marked ``interrupted``; it is
+never retried automatically, because the change may or may not have happened.
 """
 
 import json
@@ -47,6 +48,11 @@ STATUS_EXECUTING = "executing"
 STATUS_SUCCEEDED = "succeeded"
 STATUS_FAILED = "failed"
 STATUS_REJECTED = "rejected"
+STATUS_INTERRUPTED = "interrupted"
+FINAL_STATUSES = frozenset({STATUS_SUCCEEDED, STATUS_FAILED, STATUS_REJECTED, STATUS_INTERRUPTED})
+INTERRUPTED_MESSAGE = ("The executor stopped before reporting a result, so it is unknown whether this "
+                       "change was made. Check the resource in AWS before proposing it again; it was "
+                       "not retried.")
 
 _MAX_RESULT_CHARS = 30000
 
@@ -107,7 +113,22 @@ class ActionStore:
 
     def get(self, action_id: str) -> Optional[dict]:
         item = self.table.get_item(Key={"action_id": action_id}).get("Item")
-        return self._public(item) if item else None
+        return self._reconcile(self._public(item)) if item else None
+
+    def _reconcile(self, action: dict) -> dict:
+        """Mark an action that has been 'executing' for too long as interrupted."""
+        if action.get("status") != STATUS_EXECUTING:
+            return action
+        try:
+            started = datetime.fromisoformat(action.get("approved_at", "")).timestamp()
+        except ValueError:
+            return action
+        if time.time() - started > config.EXECUTION_TIMEOUT_SECONDS and self.transition(
+                action["action_id"], STATUS_EXECUTING, STATUS_INTERRUPTED,
+                finished_at=_now_iso(), result=INTERRUPTED_MESSAGE):
+            logger.warning("action_interrupted", action_id=action["action_id"])
+            action.update(status=STATUS_INTERRUPTED, result=INTERRUPTED_MESSAGE)
+        return action
 
     def list_for_session(self, tenant_id: str, session_id: str, status: str = STATUS_PENDING) -> List[dict]:
         resp = self.table.query(
@@ -162,14 +183,17 @@ class ApprovalGate(HookProvider):
 
     def __init__(self, store: ActionStore, *, tenant_id: str, session_id: str,
                  requested_by: str, account_id: Optional[str], region: Optional[str],
-                 directory=None):
+                 directory=None, checks=None):
+        from src.core.proposal_checks import ProposalChecks
         self.store = store
+        self.checks = checks if checks is not None else ProposalChecks()
         self.context = dict(tenant_id=tenant_id, session_id=session_id,
                             requested_by=requested_by, account_id=account_id, region=region)
         # With an AccountDirectory, each call's own `account` argument decides where
         # the queued action will run (see src/core/account_scope.py).
         self.directory = directory
         self.queued: List[dict] = []
+        self.companions: list = []          # other hooks to run in the same turn (e.g. memory)
 
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
         registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
@@ -179,13 +203,18 @@ class ApprovalGate(HookProvider):
         if not is_mutating(name):
             return
         tool_input = dict(event.tool_use.get("input") or {})
-        context = dict(self.context)
+        context: dict = dict(self.context)
         if self.directory is not None:
             try:
                 context["account_id"] = self.directory.resolve(tool_input.pop("account", None))
             except ValueError as e:
                 event.cancel_tool = f"NOT EXECUTED: {e}"
                 return
+        problem = self.checks.problem(name, tool_input)
+        if problem:
+            logger.info("action_refused", tool=name, reason=problem)
+            event.cancel_tool = f"NOT QUEUED: {problem}"
+            return
         try:
             action = self.store.create(tool_name=name, tool_input=tool_input, **context)
         except Exception as e:  # never fall through to executing the tool
@@ -216,7 +245,8 @@ def _result_failed(result) -> bool:
 
 def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, approver_role: str,
                     tools: Dict[str, Callable], store: ActionStore = None,
-                    audit: Callable[..., None] = None, stop_on_failure: bool = False) -> List[dict]:
+                    audit: Callable[..., None] = None, stop_on_failure: bool = False,
+                    account_allowed: Callable[[Optional[str]], bool] = None) -> List[dict]:
     """
     Run approved actions exactly as they were recorded, in the order given.
 
@@ -228,7 +258,7 @@ def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, app
     store = store or ActionStore()
     results = []
     for action_id in action_ids:
-        entry = {"action_id": action_id}
+        entry: dict = {"action_id": action_id}
         results.append(entry)
         if stop_on_failure and any(r["status"] in (STATUS_FAILED, "error") for r in results[:-1]):
             entry.update(status="skipped", error="Skipped because an earlier step failed; still pending.")
@@ -251,6 +281,10 @@ def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, app
             continue
         if config.REQUIRE_SEPARATE_APPROVER and approver == action["requested_by"]:
             entry.update(status="error", error="A different person must approve this change.")
+            continue
+        if account_allowed is not None and not account_allowed(action["account_id"] or None):
+            entry.update(status="error", error="The target account is no longer registered for "
+                                               "your organisation.")
             continue
         tool = tools.get(action["tool_name"])
         if tool is None:
@@ -279,6 +313,65 @@ def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, app
                   details={"action_id": action_id, "account_id": action["account_id"],
                            "region": action["region"], "requested_by": action["requested_by"]})
     return results
+
+
+def recorded_results(action_ids: List[str], *, tenant_id: str, store: ActionStore = None) -> Optional[List[dict]]:
+    """
+    What the record says happened to these actions, in the shape execute_actions
+    returns. None while any of them is still executing. Used to answer for an
+    approval whose console request was lost while the executor carried on.
+    """
+    store = store or ActionStore()
+    results = []
+    for action_id in action_ids:
+        action = store.get(action_id)
+        if not action or action["tenant_id"] != tenant_id:
+            results.append({"action_id": action_id, "status": "error", "error": "Action not found."})
+            continue
+        if action["status"] == STATUS_EXECUTING:
+            return None
+        entry = {"action_id": action_id, "summary": action["summary"], "tool_name": action["tool_name"],
+                 "account_id": action["account_id"] or None, "region": action["region"] or None,
+                 "status": action["status"] if action["status"] in FINAL_STATUSES else "skipped"}
+        text = action.get("result") or ""
+        if action["status"] == STATUS_SUCCEEDED:
+            entry["result"] = text
+        elif action["status"] in FINAL_STATUSES:
+            entry["error"] = text or action["status"]
+        else:
+            entry["error"] = "Not run; still pending."
+        results.append(entry)
+    return results
+
+
+def result_headline(result) -> str:
+    """One-line summary of a tool result (deployment manifests and error JSON)."""
+    if not result:
+        return ""
+    try:
+        data = json.loads(result)
+    except (TypeError, ValueError):
+        return str(result)[:300]
+    if not isinstance(data, dict):
+        return str(result)[:300]
+    if data.get("error_message"):
+        return data["error_message"][:300]
+    if data.get("resource_arn"):
+        return data["resource_arn"]
+    return str(data.get("message") or "")[:300]
+
+
+_ICONS = {STATUS_SUCCEEDED: "✅", STATUS_FAILED: "❌", "skipped": "⏭️"}
+
+
+def describe_results(results: List[dict], account_label: Callable[[Optional[str]], str]) -> str:
+    """The lines shown to the operator after an approval, one per action."""
+    lines = []
+    for r in results:
+        detail = r.get("error") or result_headline(r.get("result"))
+        lines.append(f"{_ICONS.get(r['status'], '⚠️')} {r.get('summary', r['action_id'])} in "
+                     f"{account_label(r.get('account_id'))}: {r['status']}" + (f" — {detail}" if detail else ""))
+    return "\n".join(lines)
 
 
 def reject_action(action_id: str, *, tenant_id: str, user: str, store: ActionStore = None) -> bool:

@@ -5,3 +5,10 @@ pytest==9.2.0
 moto[cloudformation]==5.2.5
 cfn-lint==1.59.0
 diagrams==0.25.1
+playwright==1.49.1
+# Checks run in CI (.github/workflows/ci.yml).
+ruff==0.16.9
+mypy==2.4.1
+types-PyYAML==6.0.12.20261111
+pip-audit==2.10.1
+coverage==7.17.2

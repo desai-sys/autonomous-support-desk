@@ -17,6 +17,7 @@ import structlog
 from botocore.config import Config
 
 import config
+from src.core import identity
 from src.core.approvals import ActionStore, reject_action
 from src.core.monitoring import metrics
 from src.core.security import User, security_manager
@@ -48,17 +49,18 @@ class AgentGateway:
 
     # ── Agent calls ───────────────────────────────────────────────────────────
 
-    def _invoke(self, payload: dict, user: User, session_id: str) -> dict:
-        payload = {
+    def _invoke(self, payload: dict, user: User, session_id: str, runtime: str = "planner") -> dict:
+        """Send a signed request to the planner (chat) or executor (approved actions) runtime."""
+        payload = identity.sign({
             **payload,
             "session_id": session_id,
             "tenant_id": user.tenant_id,
             "user": {"id": user.user_id, "email": user.email, "role": user.role.value},
-        }
+        })
         if config.AGENT_ENDPOINT_URL:
             return self._invoke_local(payload)
         response = self.client.invoke_agent_runtime(
-            agentRuntimeArn=config.AGENT_ARN,
+            agentRuntimeArn=config.EXECUTOR_RUNTIME_ARN if runtime == "executor" else config.PLANNER_RUNTIME_ARN,
             runtimeSessionId=pad_session_id(session_id),
             payload=json.dumps(payload).encode("utf-8"),
             contentType="application/json",
@@ -70,12 +72,15 @@ class AgentGateway:
 
     @staticmethod
     def _invoke_local(payload: dict) -> dict:
-        request = urllib.request.Request(
+        """Local development: POST to an agent started with `python agent_main.py`."""
+        if not config.AGENT_ENDPOINT_URL.startswith(("http://", "https://")):
+            raise ValueError("AGENT_ENDPOINT_URL must be an http(s) URL.")
+        request = urllib.request.Request(  # noqa: S310 - scheme checked above
             config.AGENT_ENDPOINT_URL.rstrip("/") + "/invocations",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=900) as resp:
+        with urllib.request.urlopen(request, timeout=900) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8") or "{}")
 
     def chat(self, text: str, user: User, session_id: str, history: Optional[List[str]] = None,
@@ -85,8 +90,8 @@ class AgentGateway:
         prompt = text
         if history:
             prompt = "Conversation so far:\n" + "\n".join(history) + f"\n\nUser: {text}"
-        payload = {"mode": "chat", "prompt": prompt, "user_message": text,
-                   "history": history or []}
+        payload: dict = {"mode": "chat", "prompt": prompt, "user_message": text,
+                         "history": history or []}
         if accounts is not None:
             payload["account_ids"] = list(accounts)
         if region:
@@ -124,17 +129,24 @@ class AgentGateway:
                 stop_on_failure: bool = False) -> dict:
         try:
             return self._invoke({"mode": "execute", "action_ids": action_ids,
-                                 "stop_on_failure": stop_on_failure}, user, session_id)
+                                 "stop_on_failure": stop_on_failure}, user, session_id, runtime="executor")
         except Exception as e:
             logger.error("execute_invocation_failed", error=str(e))
             return {"response": f"The agent is unavailable: {e}", "results": [], "error": "Unavailable"}
 
     def check_account(self, account_id: str, user: User) -> dict:
-        try:
-            return self._invoke({"mode": "check_account", "account_id": account_id}, user,
-                                f"account-check-{account_id}")
-        except Exception as e:
-            return {"ok": False, "response": f"The agent is unavailable: {e}"}
+        """Check both roles in the account: the planner's read role and the executor's change role."""
+        checks = {}
+        for runtime, label in (("planner", "read"), ("executor", "change")):
+            try:
+                checks[label] = self._invoke({"mode": "check_account", "account_id": account_id}, user,
+                                             f"account-check-{account_id}-{label}", runtime=runtime)
+            except Exception as e:
+                checks[label] = {"ok": False, "response": f"The agent is unavailable: {e}"}
+        return {"ok": all(c.get("ok") for c in checks.values()),
+                "response": " ".join(f"{label.capitalize()} access: {c.get('response', '')}"
+                                     for label, c in checks.items()),
+                "checks": {label: bool(c.get("ok")) for label, c in checks.items()}}
 
     def reject(self, action_id: str, user: User) -> bool:
         ok = reject_action(action_id, tenant_id=user.tenant_id, user=user.user_id, store=self.actions)

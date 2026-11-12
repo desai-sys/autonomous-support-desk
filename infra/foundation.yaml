@@ -172,6 +172,22 @@ Resources:
       TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
       SSESpecification: {SSEEnabled: true}
 
+  # Conversation memory: each turn with the tools it ran and what approved actions
+  # returned, so follow-ups work from facts rather than from what the browser kept.
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-conversations"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: conversation, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: conversation, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+
   UsageTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -330,6 +346,13 @@ Resources:
       Description: sts:ExternalId required by CloudOpsCrossAccountRole in managed accounts.
       GenerateSecretString: {PasswordLength: 32, ExcludePunctuation: true}
 
+  IdentityKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/identity-signing-key"
+      Description: Key the console signs agent requests with; the agent rejects unsigned or altered requests.
+      GenerateSecretString: {PasswordLength: 64, ExcludePunctuation: true}
+
   OriginVerifySecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -436,6 +459,7 @@ Outputs:
   AccountsTableName: {Value: !Ref AccountsTable}
   UsageTableName: {Value: !Ref UsageTable}
   JobsTableName: {Value: !Ref JobsTable}
+  ConversationsTableName: {Value: !Ref ConversationsTable}
   KnowledgeBaseId: {Value: !Ref KnowledgeBase}
   DataSourceId: {Value: !GetAtt KnowledgeDataSource.DataSourceId}
   KnowledgeBaseArn: {Value: !GetAtt KnowledgeBase.KnowledgeBaseArn}
@@ -443,6 +467,7 @@ Outputs:
   UserPoolArn: {Value: !GetAtt UserPool.Arn}
   UserPoolDomain: {Value: !Ref UserPoolDomain}
   ExternalIdSecretArn: {Value: !Ref ExternalIdSecret}
+  IdentityKeySecretArn: {Value: !Ref IdentityKeySecret}
   OriginVerifySecretArn: {Value: !Ref OriginVerifySecret}
   CookieSecretArn: {Value: !Ref CookieSecret}
   ConsoleRepositoryUri: {Value: !GetAtt ConsoleRepository.RepositoryUri}

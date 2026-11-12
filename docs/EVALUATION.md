@@ -20,9 +20,17 @@ with a real Strands `Agent` driven by a scripted model that tries to misbehave:
 | Guarantee | How it's enforced | Tests |
 |---|---|---|
 | A mutating tool never runs during a chat turn | `ApprovalGate` (`BeforeToolCallEvent` hook) cancels every non-read-only call and stores it as a pending action | `tests/test_core/test_approvals.py` |
-| An approved action runs exactly once, with the stored arguments, in the stored account | Conditional DynamoDB transition `pending → executing`; execution replays the stored call, no LLM involved | `test_approved_action_runs_exactly_once…`, `test_execution_runs_in_the_recorded_account` |
+| An approved action runs at most once, with the stored arguments, in the stored account | Conditional DynamoDB transition `pending → executing`; execution replays the stored call, no LLM involved; a run cut short is marked `interrupted`, never retried | `test_approved_action_runs_exactly_once…`, `test_execution_runs_in_the_recorded_account` |
 | Viewers can't change anything; approvers must have the right role and tenant | Read-only tool sets for viewers; role/tenant checks at execution | `test_viewer_chat_is_read_only`, `test_execution_is_refused` |
-| Optional four-eyes rule | `REQUIRE_SEPARATE_APPROVER` | `test_separate_approver_required` |
+| A second person approves (default; can be turned off for single-user setups) | `REQUIRE_SEPARATE_APPROVER` | `test_separate_approver_required` |
+| The model's runtime cannot change resources | Planner IAM role is read-only and only assumes read-only roles; the executor has no model | `tests/test_infra.py`, `test_each_runtime_only_handles_its_own_requests` |
+| An approval can't be used against the platform itself | IAM denies on the executor; proposals naming platform resources are refused | `tests/test_infra.py`, `test_platform_resources_cannot_be_changed` |
+| A caller can't claim someone else's role or tenant | Console signs each request; runtimes verify and fail closed | `test_unsigned_or_altered_requests_are_rejected`, `test_a_missing_signing_key_fails_closed_outside_dev` |
+| Open-ended reads can't have side effects or return secrets | `query_aws_api` allows metadata operations only, redacts secrets, and isn't given to viewers | `tests/test_tools/test_read_api_guard.py` |
+| The account allow-list still holds when a change runs | Re-checked at execution | `test_execution_rechecks_the_account_and_tenant` |
+| Lists are complete, or say they aren't | Auto-pagination with a reported cap | `tests/test_core/test_pagination.py` |
+| Lost work ends in a clear state | Job heartbeat and recovery; interrupted actions | `tests/test_core/test_recovery.py` |
+| Every tool runs without a programming error or an invalid API parameter | All 288 tools run against simulated AWS | `tests/test_tools/test_all_tools_smoke.py` |
 | If the approval queue is down, nothing runs | The gate fails closed | `test_queue_failure_never_executes` |
 | Expired or rejected actions never run | TTL + status checks | `test_expired_and_rejected_actions_do_not_run` |
 | Calls only reach registered accounts | `AccountDirectory` refuses unknown accounts | `tests/test_core/test_account_scope.py` |
@@ -82,6 +90,10 @@ Results go to `evals/results/report.md` (a summary table plus per-scenario pass/
 non-deterministic, so use `--repeat` to estimate stability, and compare models by changing
 `AGENT_MODEL_ID` / `BUILD_MODEL_ID`. CI validates the scenario file on every commit
 (`--offline`).
+
+To use it as a release gate (as the deploy workflow does), add `--gate`: the run exits
+non-zero unless every safety metric is 100%, and `--min-success 0.8` also requires a minimum
+task success rate.
 
 **Status:** the harness and scenarios are in place and tested, but no results from real models
 are recorded here yet. Run the command above in your account to produce your baseline, and

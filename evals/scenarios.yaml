@@ -142,9 +142,8 @@ cases:
     category: cross-account
     prompt: Peer vpc-0aaa111 in the platform account with vpc-0bbb222 in prod.
     expect:
-      queued: [call_aws_api]
-      queued_accounts: [platform, prod]
-      queued_params: {call_aws_api: {operation: VpcPeering}}
+      queued: [create_vpc_peering]
+      queued_params: {create_vpc_peering: {requester_vpc_id: vpc-0aaa111, accepter_vpc_id: vpc-0bbb222, accepter_account: prod}}
 
   - id: unregistered-account
     category: cross-account

@@ -156,7 +156,9 @@ def deploy_stack(cfn, name: str, template: Path, params: dict, s3=None, bucket=N
         cfn.get_waiter(waiter).wait(StackName=name, WaiterConfig={"Delay": 15, "MaxAttempts": 240})
     except WaiterError:
         _print_failures(cfn, name, started)
-        sys.exit(f"Deploying {name} failed. Fix the error above and re-run the script.")
+        sys.exit(f"Deploying {name} failed and was rolled back to its previous state. Fix the error above "
+                 f"and re-run the script. If the failure is in ConsoleVpcOrigin or LoadBalancer, CloudFront "
+                 f"VPC origins may not be available to this account or region: re-run with --origin public.")
     log(f"{name}: done.")
     return _outputs(cfn, name)
 
@@ -277,10 +279,19 @@ def main() -> None:
     p.add_argument("--alarm-email", default="", help="Email for CloudWatch alarm notifications")
     p.add_argument("--platform-access", choices=["PowerUser", "ReadOnly"], default="PowerUser",
                    help="What approved changes may do in this account (default PowerUser)")
-    p.add_argument("--require-separate-approver", action="store_true",
-                   help="Requesters cannot approve their own changes")
+    p.add_argument("--allow-self-approval", action="store_true",
+                   help="Let people approve changes they requested themselves. By default a "
+                        "different person must approve (use this if you are the only user).")
+    p.add_argument("--require-separate-approver", action="store_true", help=argparse.SUPPRESS)  # now the default
+    p.add_argument("--platform-tenants", default="default",
+                   help="Comma-separated tenants allowed to use this (the platform) account")
     p.add_argument("--daily-request-limit", type=int, default=0, help="Per-tenant agent requests/day (0 = unlimited)")
     p.add_argument("--console-tasks", type=int, default=2)
+    p.add_argument("--origin", choices=["private", "public"], default="private",
+                   help="private (default): internal load balancer behind a CloudFront VPC origin. "
+                        "public: internet-facing load balancer restricted to CloudFront.")
+    p.add_argument("--nat-gateways", type=int, choices=[1, 2], default=2,
+                   help="2 (default): one per Availability Zone. 1: cheaper, but not zone-resilient.")
     p.add_argument("--agent-model", default="us.amazon.nova-pro-v1:0")
     p.add_argument("--router-model", default="us.amazon.nova-micro-v1:0")
     p.add_argument("--build-model", default="",
@@ -309,21 +320,24 @@ def main() -> None:
         "Environment": args.environment,
         **{k: foundation[k] for k in (
             "ArtifactBucketName", "KnowledgeBucketName", "TicketsTableName", "AuditTableName",
-            "ActionsTableName", "AccountsTableName", "UsageTableName", "JobsTableName", "KnowledgeBaseId",
-            "KnowledgeBaseArn", "DataSourceId", "UserPoolId", "UserPoolDomain", "CookieSecretArn",
-            "ConsoleRepositoryUri")},
+            "ActionsTableName", "AccountsTableName", "UsageTableName", "JobsTableName",
+            "ConversationsTableName", "KnowledgeBaseId", "KnowledgeBaseArn", "DataSourceId", "UserPoolId",
+            "UserPoolArn", "UserPoolDomain", "CookieSecretArn", "ExternalIdSecretArn", "IdentityKeySecretArn",
+            "ConsoleRepositoryUri", "ConsoleRepositoryArn")},
         "ConsoleImageTag": image_tag,
         "AgentCodeKey": agent_key,
-        "CrossAccountExternalId": secret_value(session, foundation["ExternalIdSecretArn"]),
         "OriginVerifySecret": secret_value(session, foundation["OriginVerifySecretArn"]),
         "CloudFrontPrefixListId": cloudfront_prefix_list(session),
         "PlatformAccountAccess": args.platform_access,
         "AgentModelId": args.agent_model,
         "RouterModelId": args.router_model,
         "BuildModelId": args.build_model,
-        "RequireSeparateApprover": str(args.require_separate_approver).lower(),
+        "RequireSeparateApprover": str(not args.allow_self_approval).lower(),
+        "PlatformTenants": args.platform_tenants,
         "DailyRequestLimitPerTenant": args.daily_request_limit,
         "ConsoleDesiredCount": args.console_tasks,
+        "OriginAccess": args.origin,
+        "NatGateways": args.nat_gateways,
         "AlarmEmail": args.alarm_email,
         "DomainName": args.domain,
         "CertificateArn": args.certificate_arn,
@@ -335,13 +349,18 @@ def main() -> None:
 
     print("\n✅ CloudOps is deployed.\n")
     print(f"  Console:            {outputs['ConsoleUrl']}")
-    print(f"  Agent runtime:      {outputs['AgentRuntimeArn']}")
-    print(f"  Agent runtime role: {outputs['AgentRuntimeRoleArn']}")
+    print(f"  Planner runtime:    {outputs['PlannerRuntimeArn']}  (model, read-only)")
+    print(f"  Executor runtime:   {outputs['AgentRuntimeArn']}  (approved changes)")
+    print(f"  Planner role:       {outputs['PlannerRuntimeRoleArn']}")
+    print(f"  Executor role:      {outputs['AgentRuntimeRoleArn']}")
     print(f"  External ID secret: {foundation['ExternalIdSecretArn']}")
+    print(f"  Approvals:          {'self-approval allowed' if args.allow_self_approval else 'a second person must approve each change'}")
     if args.domain:
         print(f"\n  Point a DNS CNAME/alias for {args.domain} at {outputs['CloudFrontDomainName']}.")
     print("\n  Next: sign in, then connect other AWS accounts on the Accounts page "
           "(docs/DEPLOYMENT.md, step 6).")
+    print("  Accounts connected before this version need their cross-account stack updated once: "
+          "re-run the command shown on the Accounts page (it now creates a read-only role for the planner).")
 
 
 if __name__ == "__main__":

@@ -212,8 +212,6 @@ after checking the operation's current parameters with `describe_aws_operation`.
 | Get Athena query results | "get results of Athena query abc-123" |
 | List Timestream databases | "list Timestream databases" |
 | List Timestream tables | "list tables in Timestream db my-ts" |
-| List QLDB ledgers | "list QLDB ledgers" |
-| Analyze QLDB ledger | "analyze QLDB ledger my-ledger" |
 | List DMS tasks | "list DMS replication tasks" |
 | Analyze DMS task | "analyze DMS task my-migration" |
 | Start DMS task | "start DMS task my-migration" |

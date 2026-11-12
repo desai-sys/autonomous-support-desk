@@ -26,11 +26,115 @@ from src.core.aws_clients import boto3
 
 logger = structlog.get_logger()
 
-READ_PREFIXES = ("Describe", "List", "Get", "Search", "Lookup", "Scan", "Query", "BatchGet",
-                 "Check", "Validate", "Estimate", "Preview", "Simulate", "Test", "View")
-# Read operations that would hand out credentials or secrets.
-SENSITIVE_READS = re.compile(r"(Token|Credential|Password|SecretValue|AuthorizationToken|SessionToken|"
-                             r"FederationToken|Decrypt|GenerateDataKey|PrivateKey)")
+# ── What counts as a read ─────────────────────────────────────────────────────
+# Reads run immediately with no approval, so this is deliberately narrow: metadata
+# operations only. Anything not recognised here goes through call_aws_api and
+# therefore through approval.
+READ_PREFIXES = ("Describe", "List", "Get", "BatchGet", "Lookup", "Search")
+
+# Side-effect-free operations whose names don't use a read prefix.
+EXTRA_READS = frozenset({
+    ("iam", "SimulatePrincipalPolicy"), ("iam", "SimulateCustomPolicy"),
+    ("cloudformation", "ValidateTemplate"), ("cloudformation", "EstimateTemplateCost"),
+    ("accessanalyzer", "ValidatePolicy"), ("events", "TestEventPattern"),
+    ("logs", "TestMetricFilter"), ("route53", "TestDNSAnswer"),
+})
+
+# Operation names that suggest credentials, secrets or sessions are blocked by
+# default, so operations AWS adds later are refused until someone reviews them.
+SENSITIVE_READS = re.compile(
+    r"(Token|Credential|Password|Secret|PrivateKey|AccessKey|AccessDetails|ApiKey|Presigned|SignedUrl|"
+    r"Signin|LoginProfile|Session|Decrypt|DataKey|Authorization|KeyPair$|KeyPairs$|InstanceAccess|"
+    r"ComputeAccess|BootstrapBrokers|ConnectionString|Url$|URL$|Urls$|DownloadUrl|DownloadLink|"
+    r"DataAccess$|SampleConfiguration|MessageContent|DocumentContent)")
+# Reviewed exceptions to the rule above: they return metadata, never the secret.
+SENSITIVE_EXCEPTIONS = frozenset({
+    ("iam", "ListAccessKeys"), ("iam", "GetAccessKeyLastUsed"),
+    ("secretsmanager", "ListSecrets"), ("secretsmanager", "DescribeSecret"),
+    ("secretsmanager", "ListSecretVersionIds"),
+    ("ec2", "DescribeKeyPairs"), ("ssm", "DescribeSessions"),
+    ("sts", "GetAccessKeyInfo"), ("sqs", "GetQueueUrl"), ("pricing", "GetPriceListFileUrl"),
+})
+
+# Whole services that serve data or act on behalf of users rather than describe resources.
+_DATA_PLANE = re.compile(r"(-data$|data$|runtime|-session$|^sso|^cognito-identity$|^sts$|"
+                         r"^dynamodbstreams$|^kinesis$|^kinesis-video|^timestream-query$|^qldb-session$|"
+                         r"^s3outposts$|^marketplace-entitlement$|^connectparticipant$)")
+_DATA_PLANE_EXCEPTIONS = frozenset({("sts", "GetCallerIdentity"), ("sts", "GetAccessKeyInfo"),
+                                    ("kinesis", "DescribeStreamSummary"), ("kinesis", "ListStreams"),
+                                    ("kinesis", "ListShards"), ("kinesis", "DescribeStream")})
+
+# Individual operations that return stored data, source code or connection secrets.
+BLOCKED_READS = frozenset({
+    ("dynamodb", "GetItem"), ("dynamodb", "BatchGetItem"),
+    ("s3", "GetObject"), ("s3", "GetObjectTorrent"),
+    ("athena", "GetQueryResults"), ("codecommit", "GetFile"), ("codecommit", "GetBlob"),
+    ("codecommit", "GetFolder"), ("glue", "GetConnection"), ("glue", "GetConnections"),
+    ("appsync", "ListApiKeys"), ("lightsail", "GetRelationalDatabaseMasterUserPassword"),
+    ("sqs", "ReceiveMessage"), ("backup", "GetRecoveryPointRestoreMetadata"),
+})
+
+# Parameters that ask the service to include secret values in its answer.
+_REVEALING_PARAMS = ("WithDecryption", "includeValue", "IncludeValue", "includeValues", "IncludeValues",
+                     "includeCredentials", "IncludeCredentials")
+
+
+def read_refusal(service: str, api_name: str) -> str:
+    """Why this operation may not run as a read (empty string = allowed)."""
+    key = (service, api_name)
+    if not (api_name.startswith(READ_PREFIXES) or key in EXTRA_READS):
+        return (f"{api_name} is not a read-only operation; use call_aws_api so it is queued "
+                f"for approval.")
+    if key in BLOCKED_READS or (_DATA_PLANE.search(service) and key not in _DATA_PLANE_EXCEPTIONS):
+        return f"{service} {api_name} returns stored data rather than resource metadata."
+    if SENSITIVE_READS.search(api_name) and key not in SENSITIVE_EXCEPTIONS:
+        return f"{api_name} can return secrets, credentials or session access."
+    return ""
+
+
+def is_read_operation(service: str, api_name: str) -> bool:
+    return not read_refusal(service, api_name)
+
+
+def platform_resource_in(parameters: str) -> str:
+    """Name of a CloudOps-internal resource mentioned in the parameters ('' if none)."""
+    import config
+    names = [getattr(config, n, "") for n in (
+        "TICKETS_TABLE", "AUDIT_TABLE", "ACTIONS_TABLE", "ACCOUNTS_TABLE", "USAGE_TABLE", "JOBS_TABLE",
+        "CONVERSATIONS_TABLE", "ARTIFACT_BUCKET", "S3_BUCKET_NAME")] + list(config.PROTECTED_RESOURCE_NAMES)
+    text = parameters or ""
+    return next((n for n in names if n and n in text), "")
+
+
+# ── Redaction ─────────────────────────────────────────────────────────────────
+_SECRET_NAME = re.compile(r"(pass|pwd|secret|token|credential|auth|private|api[_-]?key|access[_-]?key|"
+                          r"external[_-]?id|connection|dsn|database_url|db_url|signature|pre[_-]?shared)", re.I)
+_SECRET_VALUE = re.compile(r"(X-Amz-Signature=|X-Amz-Credential=|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+                           r"://[^/\s:@]+:[^/\s@]+@)")
+_VARIABLE_MAPS = re.compile(r"^(environment)?variables$", re.I)
+REDACTED = "***redacted***"
+
+
+def redact(value, key: str = "", in_variables: bool = False):
+    """Copy of an API response with secret-looking values replaced."""
+    if isinstance(value, dict):
+        names = {k.lower(): k for k in value}
+        # {"name": "DB_PASSWORD", "value": "..."} style pairs (ECS, CodeBuild, tags).
+        if "value" in names and (names.get("name") or names.get("key")):
+            label = str(value.get(names.get("name") or names.get("key"), ""))
+            if _SECRET_NAME.search(label) and isinstance(value[names["value"]], str):
+                return {**value, names["value"]: REDACTED}
+        return {k: redact(v, k, in_variables or bool(_VARIABLE_MAPS.match(k))) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v, key, in_variables) for v in value]
+    if isinstance(value, str) and value:
+        if _SECRET_VALUE.search(value) or key in ("UserData", "CustomerGatewayConfiguration"):
+            return REDACTED
+        if _SECRET_NAME.search(key) and (in_variables or not key.endswith(("Arn", "Id", "Name", "Type"))):
+            return REDACTED
+    return value
+
+
 _MAX_CHARS = 20000
 
 
@@ -62,7 +166,7 @@ def _invoke(service: str, operation: str, parameters: str, region: str):
     method = next(m for m, a in method.items() if a == api_name)
     result = getattr(client, method)(**params)
     result.pop("ResponseMetadata", None)
-    text = json.dumps(result, default=str)
+    text = json.dumps(redact(json.loads(json.dumps(result, default=str))))
     if len(text) > _MAX_CHARS:
         text = text[:_MAX_CHARS] + f'... [truncated {len(text) - _MAX_CHARS} chars; narrow the request]'
     return api_name, text
@@ -113,7 +217,10 @@ def _error(e: Exception, service: str, operation: str) -> str:
 
 @tool
 def query_aws_api(service: str, operation: str, parameters: str = '{}', region: str = 'us-east-1') -> str:
-    """Run a READ-ONLY AWS API operation (Describe*, List*, Get*, Search*, ...) when no specific tool fits.
+    """Run a READ-ONLY AWS metadata operation (Describe*, List*, Get*, Search*, ...) when no specific tool fits.
+
+    Operations that return stored data, credentials or secrets are refused, and secret-looking
+    values in results are redacted.
 
     Args:
         service: boto3 client name, e.g. ec2, s3, rds, iam, elbv2, logs.
@@ -126,14 +233,20 @@ def query_aws_api(service: str, operation: str, parameters: str = '{}', region: 
     """
     try:
         api_name = _operation(service, operation)
-        if not api_name.startswith(READ_PREFIXES):
-            return json.dumps({"status": "failed", "error_type": "not_read_only",
-                               "error_message": f"{api_name} changes resources; use call_aws_api so it "
-                                                f"is queued for approval."})
-        if SENSITIVE_READS.search(api_name) or _params(parameters).get("WithDecryption") is True:
+        refusal = read_refusal(service, api_name)
+        if refusal:
+            kind = "not_read_only" if "not a read-only" in refusal else "sensitive_operation"
+            return json.dumps({"status": "failed", "error_type": kind, "error_message": refusal})
+        params = _params(parameters)
+        if any(params.get(p) is True for p in _REVEALING_PARAMS):
             return json.dumps({"status": "failed", "error_type": "sensitive_operation",
-                               "error_message": f"{api_name} returns secrets or credentials and is not "
-                                                f"available to the agent."})
+                               "error_message": "Parameters that reveal secret values are not available "
+                                                "to the agent."})
+        internal = platform_resource_in(parameters)
+        if internal:
+            return json.dumps({"status": "failed", "error_type": "platform_resource",
+                               "error_message": f"{internal} belongs to the CloudOps platform itself and "
+                                                f"is not available to the agent."})
         _, text = _invoke(service, operation, parameters, region)
         return text
     except Exception as e:
@@ -186,7 +299,7 @@ def list_aws_operations(service: str, keyword: str = '') -> str:
             names = [n for n in names if keyword.lower().replace(" ", "") in n.lower()]
         return json.dumps({
             "service": service, "count": len(names),
-            "operations": [{"name": n, "read_only": n.startswith(READ_PREFIXES)} for n in names[:200]],
+            "operations": [{"name": n, "read_only": is_read_operation(service, n)} for n in names[:200]],
             "truncated": len(names) > 200,
         })
     except Exception as e:
@@ -228,7 +341,7 @@ def describe_aws_operation(service: str, operation: str, parameter: str = '') ->
             inputs = _member(inputs, parameter)
         result = {
             "service": service, "operation": api_name,
-            "read_only": api_name.startswith(READ_PREFIXES),
+            "read_only": is_read_operation(service, api_name),
             "description": _doc(op.documentation, 900) if not parameter else _doc(inputs.documentation, 900),
             "required": list(getattr(inputs, "required_members", []) or []) if inputs is not None else [],
             "parameters": {},

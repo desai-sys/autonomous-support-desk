@@ -6,7 +6,6 @@ Covers RDS, DynamoDB, ElastiCache, DocumentDB, Neptune, and Redshift operations.
 from src.core.aws_clients import boto3  # account-aware boto3 shim (cross-account support)
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
 from strands import tool
 import structlog
 
@@ -70,7 +69,7 @@ def analyze_rds_instance(db_instance_id: str) -> str:
                 if metric_response['Datapoints']:
                     latest = max(metric_response['Datapoints'], key=lambda x: x['Timestamp'])
                     metrics[metric_name] = latest
-            except:
+            except Exception:
                 metrics[metric_name] = {'Average': 0, 'Maximum': 0}
         
         # Get automated backups
@@ -86,7 +85,7 @@ def analyze_rds_instance(db_instance_id: str) -> str:
             'storage_type': instance['StorageType'],
             'storage_encrypted': instance['StorageEncrypted'],
             'multi_az': instance['MultiAZ'],
-            'publicly_accessible': instance['PubliclyAccessible'],
+            'publicly_accessible': instance.get('PubliclyAccessible', False),
             'endpoint': instance.get('Endpoint', {}).get('Address', 'N/A'),
             'port': instance.get('Endpoint', {}).get('Port', 'N/A'),
             'vpc_id': instance.get('DBSubnetGroup', {}).get('VpcId', 'N/A'),
@@ -160,7 +159,7 @@ def modify_rds_instance(db_instance_id: str, instance_class: str = None,
         if not changes:
             return "No modifications specified"
         
-        response = rds.modify_db_instance(**modify_params)
+        rds.modify_db_instance(**modify_params)
         
         apply_time = "immediately" if apply_immediately else "during next maintenance window"
         return f"Modified RDS instance {db_instance_id}: {', '.join(changes)}. Changes will be applied {apply_time}."
@@ -207,7 +206,7 @@ def analyze_dynamodb_table(table_name: str) -> str:
                 if metric_response['Datapoints']:
                     latest = max(metric_response['Datapoints'], key=lambda x: x['Timestamp'])
                     metrics[metric_name] = latest
-            except:
+            except Exception:
                 metrics[metric_name] = {'Sum': 0, 'Average': 0, 'Maximum': 0}
         
         # Parse key schema
@@ -277,7 +276,7 @@ def update_dynamodb_capacity(table_name: str, read_capacity: int = None,
             if not read_capacity or not write_capacity:
                 return "Both read and write capacity must be specified for GSI updates"
             
-            response = dynamodb.update_table(
+            dynamodb.update_table(
                 TableName=table_name,
                 GlobalSecondaryIndexUpdates=[{
                     'Update': {
@@ -306,7 +305,7 @@ def update_dynamodb_capacity(table_name: str, read_capacity: int = None,
             if not changes:
                 return "No capacity changes specified"
             
-            response = dynamodb.update_table(**update_params)
+            dynamodb.update_table(**update_params)
             
             return f"Updated DynamoDB table {table_name}: {', '.join(changes)}"
         
@@ -320,7 +319,7 @@ def enable_dynamodb_point_in_time_recovery(table_name: str) -> str:
     try:
         dynamodb = boto3.client('dynamodb', region_name='us-east-1')
         
-        response = dynamodb.update_continuous_backups(
+        dynamodb.update_continuous_backups(
             TableName=table_name,
             PointInTimeRecoverySpecification={'PointInTimeRecoveryEnabled': True}
         )
@@ -362,7 +361,7 @@ def analyze_elasticache_cluster(cluster_id: str) -> str:
                     'snapshot_window': cluster.get('SnapshotWindow', 'N/A'),
                     'maintenance_window': cluster.get('PreferredMaintenanceWindow', 'N/A')
                 }
-        except:
+        except Exception:
             # Try Memcached
             response = elasticache.describe_cache_clusters(CacheClusterId=cluster_id, ShowCacheNodeInfo=True)
             if response['CacheClusters']:
@@ -410,7 +409,7 @@ def analyze_elasticache_cluster(cluster_id: str) -> str:
                 if metric_response['Datapoints']:
                     latest = max(metric_response['Datapoints'], key=lambda x: x['Timestamp'])
                     metrics[metric_name] = latest
-            except:
+            except Exception:
                 metrics[metric_name] = {'Average': 0, 'Maximum': 0}
         
         cluster_info['recent_metrics'] = metrics
@@ -431,7 +430,7 @@ def create_elasticache_snapshot(cluster_id: str, snapshot_name: str = None) -> s
             timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
             snapshot_name = f"{cluster_id}-manual-{timestamp}"
         
-        response = elasticache.create_snapshot(
+        elasticache.create_snapshot(
             ReplicationGroupId=cluster_id,
             SnapshotName=snapshot_name
         )
@@ -497,7 +496,7 @@ def analyze_documentdb_cluster(cluster_id: str) -> str:
                 if metric_response['Datapoints']:
                     latest = max(metric_response['Datapoints'], key=lambda x: x['Timestamp'])
                     metrics[metric_name] = latest
-            except:
+            except Exception:
                 metrics[metric_name] = {'Average': 0, 'Maximum': 0}
         
         analysis = {
@@ -532,7 +531,7 @@ def create_documentdb_snapshot(cluster_id: str, snapshot_id: str = None) -> str:
             timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
             snapshot_id = f"{cluster_id}-manual-{timestamp}"
         
-        response = docdb.create_db_cluster_snapshot(
+        docdb.create_db_cluster_snapshot(
             DBClusterSnapshotIdentifier=snapshot_id,
             DBClusterIdentifier=cluster_id,
             Tags=[
