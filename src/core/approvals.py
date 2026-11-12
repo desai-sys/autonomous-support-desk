@@ -223,7 +223,8 @@ def _result_failed(result) -> bool:
 
 def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, approver_role: str,
                     tools: Dict[str, Callable], store: ActionStore = None,
-                    audit: Callable[..., None] = None, stop_on_failure: bool = False) -> List[dict]:
+                    audit: Callable[..., None] = None, stop_on_failure: bool = False,
+                    account_allowed: Callable[[Optional[str]], bool] = None) -> List[dict]:
     """
     Run approved actions exactly as they were recorded, in the order given.
 
@@ -258,6 +259,10 @@ def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, app
             continue
         if config.REQUIRE_SEPARATE_APPROVER and approver == action["requested_by"]:
             entry.update(status="error", error="A different person must approve this change.")
+            continue
+        if account_allowed is not None and not account_allowed(action["account_id"] or None):
+            entry.update(status="error", error="The target account is no longer registered for "
+                                               "your organisation.")
             continue
         tool = tools.get(action["tool_name"])
         if tool is None:

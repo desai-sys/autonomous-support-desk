@@ -172,8 +172,10 @@ def run_case(case: Case, default_fixtures: dict) -> CaseResult:
             mock.patch.object(ep.router, "route", route), \
             mock.patch.object(ep.usage_meter, "allow_request", lambda tenant: True), \
             mock.patch.object(ep.security_manager, "log_audit_event", lambda *a, **k: None), \
+            mock.patch.object(ep.tenancy, "platform_allowed", lambda tenant: True), \
             mock.patch.object(AccountRegistry, "list",
-                              lambda self: {a: {"account_id": a, "name": n} for a, n in ACCOUNTS.items()}):
+                              lambda self, tenant_id=None: {a: {"account_id": a, "name": n}
+                                                            for a, n in ACCOUNTS.items()}):
         result = ep.invoke(payload)
     seconds = time.time() - started
 

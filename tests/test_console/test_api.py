@@ -125,7 +125,9 @@ def test_accounts_admin(client):
     assert client.post("/api/accounts", json={"account_id": "1111-2222-3333", "name": "prod"}, headers=H).json()["account_id"] == "111122223333"
     assert client.post("/api/accounts", json={"account_id": "123"}, headers=H).status_code == 400
     assert [a["name"] for a in client.get("/api/accounts").json()] == ["prod"]
-    assert "ExternalId=" in client.get("/api/accounts/setup").json()["command"]
+    command = client.get("/api/accounts/setup").json()["command"]
+    assert "ExternalId=" in command and "PlannerRuntimeRoleArn=" in command and "AgentRuntimeRoleArn=" in command
+    assert client.delete("/api/accounts/999988887777", headers=H).status_code == 404
     client.delete("/api/accounts/111122223333", headers=H)
     assert client.get("/api/accounts").json() == []
 
@@ -189,3 +191,18 @@ def test_approve_all_in_order_stops_on_failure(client, monkeypatch):
     login(client, "viewer")
     assert client.post("/api/actions/approve-batch", json={"conversation_id": "c", "action_ids": ["a1"]},
                        headers=H).status_code == 403
+
+
+def test_console_refuses_to_start_half_configured():
+    """Sign-in defaults to Cognito, so a missing setting can never open the developer login."""
+    import subprocess
+    import sys
+    base = {"PATH": "/usr/bin:/bin:/usr/local/bin", "AWS_DEFAULT_REGION": "us-east-1"}
+    run = lambda env: subprocess.run([sys.executable, "-c", "import console.server"], env={**base, **env},  # noqa: E731
+                                     capture_output=True, text=True)
+    unset = run({})                                              # AUTH_MODE not set at all
+    assert unset.returncode != 0 and "AUTH_MODE=oidc needs" in unset.stderr
+    weak = run({"AUTH_MODE": "oidc", "OIDC_CLIENT_ID": "x", "OIDC_METADATA_URL": "https://x", "OIDC_COOKIE_SECRET": "short"})
+    assert weak.returncode != 0
+    assert run({"AUTH_MODE": "anything"}).returncode != 0
+    assert run({"AUTH_MODE": "local"}).returncode == 0

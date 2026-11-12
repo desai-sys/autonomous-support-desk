@@ -63,8 +63,8 @@ def test_viewer_chat_is_read_only(ep, monkeypatch):
 
 
 def test_single_run_sees_every_registered_account(ep, monkeypatch):
-    ep.account_registry.add("111122223333", "prod", "admin")
-    ep.account_registry.add("444455556666", "ta-aws-1", "admin")
+    ep.account_registry.add("111122223333", "prod", "admin", "t1")
+    ep.account_registry.add("444455556666", "ta-aws-1", "admin", "t1")
     runs = []
 
     def fake_run(prompt, domains, notes, gate, read_only=False, directory=None):
@@ -85,8 +85,8 @@ def test_single_run_sees_every_registered_account(ep, monkeypatch):
 
 
 def test_selected_accounts_become_default_or_each(ep, monkeypatch):
-    ep.account_registry.add("111122223333", "prod", "admin")
-    ep.account_registry.add("444455556666", "dev", "admin")
+    ep.account_registry.add("111122223333", "prod", "admin", "t1")
+    ep.account_registry.add("444455556666", "dev", "admin", "t1")
     runs = []
     monkeypatch.setattr(ep, "_run_agent_with_domains",
                         lambda prompt, domains, notes, gate, read_only=False, directory=None:
@@ -113,7 +113,8 @@ def test_bad_requests(ep):
 @pytest.fixture
 def gateway(tables, monkeypatch):
     from src.agents import gateway as gw
-    monkeypatch.setattr(gw.config, "AGENT_ARN", "arn:aws:bedrock-agentcore:us-east-1:1:runtime/x")
+    monkeypatch.setattr(gw.config, "PLANNER_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-east-1:1:runtime/planner")
+    monkeypatch.setattr(gw.config, "EXECUTOR_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-east-1:1:runtime/executor")
     g = gw.AgentGateway()
     g.client = MagicMock()
     g.rag = MagicMock()
@@ -163,3 +164,133 @@ def test_account_name_labels_results(tables, monkeypatch):
     assert ep._account_name("111111111111") == "ta-aws-1 (111111111111)"
     assert ep._account_name(None) == "the platform account"
     assert ep._account_name("222222222222") == "222222222222"
+
+
+# ── Runtime split, signed identity and tenancy ──────────────────────────────
+
+def test_chat_goes_to_the_planner_and_approvals_to_the_executor(gateway, monkeypatch):
+    monkeypatch.setitem(gateway.__class__.__init__.__globals__["config"]._secrets, "IDENTITY_SIGNING_KEY", "k" * 40)
+    respond(gateway, {"response": "hi"})
+    gateway.chat("hello", user(), "conv-1")
+    call = gateway.client.invoke_agent_runtime.call_args.kwargs
+    assert call["agentRuntimeArn"].endswith("/planner")
+    assert set(json.loads(call["payload"])["auth"]) == {"ts", "sig"}          # signed by the console
+
+    respond(gateway, {"response": "done", "results": []})
+    gateway.approve(["a1"], user(), "conv-1")
+    call = gateway.client.invoke_agent_runtime.call_args.kwargs
+    assert call["agentRuntimeArn"].endswith("/executor")
+    assert json.loads(call["payload"])["action_ids"] == ["a1"]
+
+
+def test_account_check_covers_both_roles(gateway):
+    gateway.client.invoke_agent_runtime.side_effect = [
+        {"response": io.BytesIO(json.dumps({"ok": True, "response": "Connected."}).encode())},
+        {"response": io.BytesIO(json.dumps({"ok": False, "response": "AccessDenied"}).encode())}]
+    out = gateway.check_account("111122223333", user(UserRole.ADMIN))
+    assert out["ok"] is False and out["checks"] == {"read": True, "change": False}
+    arns = [c.kwargs["agentRuntimeArn"] for c in gateway.client.invoke_agent_runtime.call_args_list]
+    assert arns[0].endswith("/planner") and arns[1].endswith("/executor")
+
+
+@pytest.mark.parametrize("runtime,mode,ok", [
+    ("planner", "chat", True), ("planner", "execute", False),
+    ("executor", "execute", True), ("executor", "chat", False),
+])
+def test_each_runtime_only_handles_its_own_requests(ep, monkeypatch, runtime, mode, ok):
+    monkeypatch.setattr(ep.config, "RUNTIME_MODE", runtime)
+    monkeypatch.setattr(ep, "_run_agent_with_domains", lambda *a, **k: ("ok", ["compute"], 1))
+    out = ep.invoke(payload(mode=mode, action_ids=["missing"]))
+    assert (out.get("error") != "WrongRuntime") is ok
+
+
+def test_unsigned_or_altered_requests_are_rejected(ep, monkeypatch):
+    from src.core import identity
+    monkeypatch.setitem(ep.config._secrets, "IDENTITY_SIGNING_KEY", "k" * 40)
+    monkeypatch.setattr(ep, "_run_agent_with_domains", lambda *a, **k: ("ok", ["compute"], 1))
+    assert ep.invoke(payload())["error"] == "Unauthorized"                    # unsigned
+
+    signed = identity.sign(payload(user={"id": "v", "role": "viewer"}))
+    assert "error" not in ep.invoke(signed)
+    forged = {**signed, "user": {"id": "v", "role": "admin"}}                 # role changed after signing
+    assert ep.invoke(forged)["error"] == "Unauthorized"
+    assert ep.invoke({**signed, "tenant_id": "other"})["error"] == "Unauthorized"
+    stale = identity.sign(payload(), now=1_000_000)
+    assert ep.invoke(stale)["error"] == "Unauthorized"
+    assert ep.invoke(identity.sign(payload(), key="wrong-key" * 5))["error"] == "Unauthorized"
+
+
+def test_a_missing_signing_key_fails_closed_outside_dev(ep, monkeypatch):
+    monkeypatch.setitem(ep.config._secrets, "IDENTITY_SIGNING_KEY", "")
+    monkeypatch.setattr(ep.config, "ENVIRONMENT", "prod")
+    assert ep.invoke(payload())["error"] == "Unauthorized"
+
+
+def test_tenants_only_reach_their_own_accounts(ep, monkeypatch):
+    ep.account_registry.add("111122223333", "prod", "admin", "t1")
+    ep.account_registry.add("444455556666", "acme-prod", "admin", "acme")
+    seen = {}
+
+    def fake_run(prompt, domains, notes, gate, read_only=False, directory=None):
+        seen["directory"] = directory
+        return "ok", domains, 1
+    monkeypatch.setattr(ep, "_run_agent_with_domains", fake_run)
+
+    ep.invoke(payload(tenant_id="acme", account_ids=["111122223333"]))
+    d = seen["directory"]
+    assert set(d.registered) == {"444455556666"}                 # not t1's account, even when asked for
+    assert d.default == "444455556666"                           # their only account is the default
+    from src.core.account_scope import UnknownAccount
+    with pytest.raises(UnknownAccount):
+        d.resolve("platform")                                    # acme is not a platform tenant
+    with pytest.raises(UnknownAccount):
+        d.resolve("111122223333")
+    assert "platform" not in d.prompt_note().split("Available accounts:")[1].split("If `account`")[0]
+
+
+def test_an_account_belongs_to_one_tenant(tables):
+    from src.core.accounts import AccountRegistry
+    reg = AccountRegistry()
+    reg.add("111122223333", "prod", "alice", "t1")
+    with pytest.raises(ValueError, match="another organisation"):
+        reg.add("111122223333", "stolen", "mallory", "acme")
+    assert reg.list("acme") == {} and not reg.remove("111122223333", "acme")
+    assert reg.remove("111122223333", "t1") and reg.list("t1") == {}
+
+
+def test_execution_rechecks_the_account_and_tenant(ep, monkeypatch):
+    ran = []
+    monkeypatch.setitem(ep.TOOL_REGISTRY, "stop_ec2_instance", lambda **kw: ran.append(kw) or "{}")
+    ep.account_registry.add("111122223333", "prod", "admin", "t1")
+    action = ep.action_store.create(tenant_id="t1", session_id="s1", requested_by="alice",
+                                    account_id="111122223333", region="us-east-1",
+                                    tool_name="stop_ec2_instance", tool_input={"instance_id": "i-1"})
+    ep.account_registry.remove("111122223333", "t1")             # unregistered after the proposal
+    out = ep.invoke({"mode": "execute", "action_ids": [action["action_id"]], "tenant_id": "t1",
+                     "user": {"id": "bob", "role": "sre"}})
+    assert "no longer registered" in out["results"][0]["error"] and ran == []
+
+
+def test_each_tenant_presents_its_own_external_id(monkeypatch):
+    import config
+    from src.core import tenancy
+    monkeypatch.setitem(config._secrets, "CROSS_ACCOUNT_EXTERNAL_ID", "base-external-id-000000")
+    assert tenancy.external_id_for("default") == "base-external-id-000000"
+    acme, globex = tenancy.external_id_for("acme"), tenancy.external_id_for("globex")
+    assert len(acme) == 40 and acme != globex and "base" not in acme
+
+
+def test_viewers_do_not_get_open_ended_api_access(ep, monkeypatch):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, tools=None, **kw):
+            captured["tools"] = [t.tool_name for t in tools]
+
+        def __call__(self, prompt):
+            raise RuntimeError("stop here")
+    monkeypatch.setattr(ep, "Agent", FakeAgent)
+    with pytest.raises(RuntimeError):
+        ep._run_agent_with_domains("list things", ["compute"], [], None, read_only=True)
+    assert "query_aws_api" not in captured["tools"] and "list_ec2_instances" in captured["tools"]
+    assert not any(ep.is_mutating(t) for t in captured["tools"])

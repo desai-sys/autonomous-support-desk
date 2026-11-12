@@ -28,11 +28,8 @@ from typing import Optional
 
 import boto3 as _boto3
 
-from config import (
-    AWS_REGION as _DEFAULT_REGION,
-    CROSS_ACCOUNT_EXTERNAL_ID,
-    CROSS_ACCOUNT_ROLE_NAME,
-)
+import config
+from config import AWS_REGION as _DEFAULT_REGION
 
 
 # ---------------------------------------------------------------------------
@@ -111,21 +108,25 @@ def _assume_role_credentials(account_id: str) -> dict:
     Return valid temporary credentials for ``account_id``, assuming
     ``CROSS_ACCOUNT_ROLE_NAME`` in it. Credentials are cached until near expiry.
     """
+    from src.core import request_context, tenancy
+    tenant = request_context.tenant_id()
+    cache_key = (tenant, account_id, config.CROSS_ACCOUNT_ROLE_NAME)
     now = time.time()
     with _creds_lock:
-        entry = _creds_cache.get(account_id)
+        entry = _creds_cache.get(cache_key)
         if entry and entry["expiry"] - _EXPIRY_SKEW_SECONDS > now:
             return entry["credentials"]
 
     sts = _boto3.client("sts", region_name=_DEFAULT_REGION)
-    role_arn = f"arn:aws:iam::{account_id}:role/{CROSS_ACCOUNT_ROLE_NAME}"
+    role_arn = f"arn:aws:iam::{account_id}:role/{config.CROSS_ACCOUNT_ROLE_NAME}"
     params = {
         "RoleArn": role_arn,
-        "RoleSessionName": f"cloudops-agent-{account_id}",
+        "RoleSessionName": f"cloudops-{config.RUNTIME_MODE}-{account_id}",
         "DurationSeconds": 3600,
     }
-    if CROSS_ACCOUNT_EXTERNAL_ID:
-        params["ExternalId"] = CROSS_ACCOUNT_EXTERNAL_ID
+    external_id = tenancy.external_id_for(tenant)
+    if external_id:
+        params["ExternalId"] = external_id
     resp = sts.assume_role(**params)
     creds = resp["Credentials"]
     scoped = {
@@ -135,7 +136,7 @@ def _assume_role_credentials(account_id: str) -> dict:
     }
     expiry = creds["Expiration"].timestamp()
     with _creds_lock:
-        _creds_cache[account_id] = {"credentials": scoped, "expiry": expiry}
+        _creds_cache[cache_key] = {"credentials": scoped, "expiry": expiry}
     return scoped
 
 

@@ -22,20 +22,24 @@ Parameters:
   AccountsTableName: {Type: String}
   UsageTableName: {Type: String}
   JobsTableName: {Type: String}
+  ConversationsTableName: {Type: String}
   KnowledgeBaseId: {Type: String}
   KnowledgeBaseArn: {Type: String}
   DataSourceId: {Type: String}
   UserPoolId: {Type: String}
+  UserPoolArn: {Type: String}
   UserPoolDomain: {Type: String}
   CookieSecretArn: {Type: String}
+  ExternalIdSecretArn: {Type: String}
+  IdentityKeySecretArn: {Type: String}
   ConsoleRepositoryUri: {Type: String}
+  ConsoleRepositoryArn: {Type: String}
   # Build outputs (scripts/deploy.py)
   ConsoleImageTag: {Type: String}
   AgentCodeKey:
     Type: String
     Description: S3 key of the agent package zip in the artifact bucket.
-  # Secrets read by scripts/deploy.py from Secrets Manager
-  CrossAccountExternalId: {Type: String, NoEcho: true}
+  # Read by scripts/deploy.py from Secrets Manager (CloudFront needs the value itself)
   OriginVerifySecret: {Type: String, NoEcho: true}
   CloudFrontPrefixListId:
     Type: String
@@ -45,8 +49,19 @@ Parameters:
     Type: String
     Default: PowerUser
     AllowedValues: [PowerUser, ReadOnly]
-    Description: What the agent may do in this (the platform) account once a change is approved.
-  CrossAccountRoleName: {Type: String, Default: CloudOpsCrossAccountRole}
+    Description: What the executor may do in this (the platform) account once a change is approved.
+  CrossAccountRoleName:
+    Type: String
+    Default: CloudOpsCrossAccountRole
+    Description: Role the executor assumes in managed accounts to run approved changes.
+  CrossAccountReadRoleName:
+    Type: String
+    Default: CloudOpsCrossAccountReadRole
+    Description: Read-only role the planner (the model) assumes in managed accounts.
+  PlatformTenants:
+    Type: String
+    Default: default
+    Description: Comma-separated tenants allowed to use the platform account itself.
   AgentModelId: {Type: String, Default: us.amazon.nova-pro-v1:0}
   RouterModelId: {Type: String, Default: us.amazon.nova-micro-v1:0}
   BuildModelId:
@@ -55,7 +70,7 @@ Parameters:
     Description: Model for the app builder; empty uses AgentModelId.
   RequireSeparateApprover:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues: ["true", "false"]
   DailyRequestLimitPerTenant: {Type: Number, Default: 0, MinValue: 0}
   ConsoleDesiredCount: {Type: Number, Default: 2, MinValue: 1}
@@ -75,10 +90,125 @@ Resources:
   # ════════════════════════════════════════════════════════════════════════════
   # Agent — Bedrock AgentCore Runtime (direct code deployment from S3)
   # ════════════════════════════════════════════════════════════════════════════
+  # The agent runs as two runtimes. The planner talks to the model and can only
+  # read; the executor runs approved actions, has no model, and is the only one
+  # holding credentials that can change anything.
+  PlannerRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-planner-runtime-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+      Policies:
+        - PolicyName: planner-platform
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Models
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: QueueProposals
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
+              - Sid: AccountsAndUsage
+                Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsageTableName}"
+              - Sid: ConversationMemory
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Query]
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConversationsTableName}"
+              - Sid: GeneratedAppDrafts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/apps/*"
+              - Sid: UploadedCode
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/uploads/*"
+              - Sid: ValidateGeneratedTemplates
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+              - Sid: AssumeReadRolesInManagedAccounts
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${CrossAccountReadRoleName}"
+              - Sid: RuntimeSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref ExternalIdSecretArn, !Ref IdentityKeySecretArn]
+              - Sid: RuntimeLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: Tracing
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT,
+                         bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource: "*"
+        # ReadOnlyAccess would otherwise let the model read the platform's own data
+        # (other tenants' tickets, the audit trail, users, uploaded code).
+        - PolicyName: planner-may-not-read-the-platform
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PlatformRecords
+                Effect: Deny
+                Action: [dynamodb:GetItem, dynamodb:BatchGetItem, dynamodb:Query, dynamodb:Scan,
+                         dynamodb:PartiQLSelect, dynamodb:GetRecords, dynamodb:ExportTableToPointInTime]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}/*"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${JobsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}/*"
+              - Sid: PlatformUsers
+                Effect: Deny
+                Action: "cognito-idp:*"
+                Resource: !Ref UserPoolArn
+              - Sid: PlatformFiles
+                Effect: Deny
+                Action: ["s3:GetObject*", "s3:ListBucketVersions"]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/agent/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/builds/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/templates/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${KnowledgeBucketName}/*"
+              - Sid: PlatformLogs
+                Effect: Deny
+                Action: [logs:GetLogEvents, logs:FilterLogEvents, logs:StartQuery, logs:GetLogRecord,
+                         logs:StartLiveTail, logs:Unmask]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${AppName}/*"
+
   AgentRuntimeRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${AppName}-agent-runtime-${AWS::Region}"
+      Description: Executor runtime - runs approved actions; no model access is needed.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -93,45 +223,38 @@ Resources:
            !Sub "arn:${AWS::Partition}:iam::aws:policy/IAMReadOnlyAccess"]
         - [!Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"]
       Policies:
-        - PolicyName: agent-platform
+        - PolicyName: executor-platform
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: Models
+              - Sid: ApprovedActions
                 Effect: Allow
-                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
-                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
-              - Sid: PlatformTables
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
+              - Sid: AuditAndMemory
                 Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Action: dynamodb:PutItem
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
-                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}/index/*"
-                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
                   - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
-                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsageTableName}"
-              - Sid: AgentCodeAndUploads
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConversationsTableName}"
+              - Sid: Accounts
+                Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:GetItem]
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
+              - Sid: UploadsAndDrafts
                 Effect: Allow
                 Action: [s3:GetObject, s3:GetObjectVersion]
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/agent/*"
                   - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/uploads/*"
-              - Sid: GeneratedAppDrafts
-                Effect: Allow
-                Action: [s3:GetObject, s3:PutObject]
-                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/apps/*"
-              - Sid: ListGeneratedAppVersions
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}"
-                Condition:
-                  StringLike: {"s3:prefix": ["apps/*"]}
+                  - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/apps/*"
               - Sid: AssumeManagedAccountRoles
                 Effect: Allow
                 Action: sts:AssumeRole
                 Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${CrossAccountRoleName}"
+              - Sid: RuntimeSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref ExternalIdSecretArn, !Ref IdentityKeySecretArn]
               - Sid: RuntimeLogs
                 Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
@@ -174,11 +297,175 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
                   - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 
+  PlannerRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Sub "${AppName}_planner"
+      Description: CloudOps planner - talks to the model with read-only access and queues proposed changes
+      RoleArn: !GetAtt PlannerRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Runtime: PYTHON_3_12
+          EntryPoint: [agent_main.py]
+          Code:
+            S3:
+              Bucket: !Ref ArtifactBucketName
+              Prefix: !Ref AgentCodeKey
+      NetworkConfiguration: {NetworkMode: PUBLIC}
+      ProtocolConfiguration: HTTP
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: 900
+        MaxLifetime: 28800
+      EnvironmentVariables:
+        CLOUDOPS_ENV: !Ref Environment
+        RUNTIME_MODE: planner
+        TICKETS_TABLE: !Ref TicketsTableName
+        AUDIT_TABLE: !Ref AuditTableName
+        ACTIONS_TABLE: !Ref ActionsTableName
+        ACCOUNTS_TABLE: !Ref AccountsTableName
+        USAGE_TABLE: !Ref UsageTableName
+        JOBS_TABLE: !Ref JobsTableName
+        CONVERSATIONS_TABLE: !Ref ConversationsTableName
+        ARTIFACT_BUCKET: !Ref ArtifactBucketName
+        KB_BUCKET: !Ref KnowledgeBucketName
+        AGENT_MODEL_ID: !Ref AgentModelId
+        ROUTER_MODEL_ID: !Ref RouterModelId
+        BUILD_MODEL_ID: !Ref BuildModelId
+        DAILY_REQUEST_LIMIT_PER_TENANT: !Ref DailyRequestLimitPerTenant
+        CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountReadRoleName
+        # Secrets are fetched at run time; a runtime's plain environment is readable through the API.
+        CROSS_ACCOUNT_EXTERNAL_ID_SECRET_ARN: !Ref ExternalIdSecretArn
+        IDENTITY_SIGNING_KEY_SECRET_ARN: !Ref IdentityKeySecretArn
+        REQUIRE_SEPARATE_APPROVER: !Ref RequireSeparateApprover
+        PLATFORM_TENANTS: !Ref PlatformTenants
+        PROTECTED_RESOURCE_NAMES: !Sub "${UserPoolId},${AppName}_agent,${AppName}_planner,${AppName}-foundation,${AppName}-app,${AppName}/"
+      Tags:
+        App: !Ref AppName
+
+  # The executor has broad rights so that approved changes can run, which would
+  # also let an approved "change" rewrite the platform that controls it: make
+  # someone an admin, edit the account allow-list, delete the audit trail, or
+  # replace the agent's own code or permissions. These denies take the platform
+  # itself out of the executor's reach; an administrator changes it directly.
+  ExecutorPlatformProtection:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref AgentRuntimeRole
+      PolicyName: executor-may-not-change-the-platform
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Users
+            Effect: Deny
+            Action: "cognito-idp:*"
+            Resource: !Ref UserPoolArn
+          - Sid: RecordsItNeverTouches
+            Effect: Deny
+            Action: "dynamodb:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}"
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}/*"
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${JobsTableName}"
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsageTableName}"
+          - Sid: ApprovalsOnlyThroughTheStateMachine
+            Effect: Deny
+            NotAction: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DescribeTable]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}"
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ActionsTableName}/*"
+          - Sid: AuditAndMemoryAreAppendOnly
+            Effect: Deny
+            NotAction: [dynamodb:PutItem, dynamodb:DescribeTable]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AuditTableName}"
+              - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConversationsTableName}"
+          - Sid: AccountAllowListIsReadOnly
+            Effect: Deny
+            NotAction: [dynamodb:Scan, dynamodb:GetItem, dynamodb:DescribeTable]
+            Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}"
+          - Sid: PlatformSecrets
+            Effect: Deny
+            NotAction: secretsmanager:GetSecretValue
+            Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/*"
+          - Sid: SecretsItDoesNotUse
+            Effect: Deny
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !Ref CookieSecretArn
+              - !Ref OidcClientSecret
+              - !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/origin-verify-*"
+          - Sid: ItsOwnRuntimesStacksAndRoles
+            Effect: Deny
+            Action: ["bedrock-agentcore:*", "cloudformation:*", "iam:*"]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AppName}_*"
+              - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-foundation/*"
+              - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-app/*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-agent-runtime-*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-planner-runtime-*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-app-*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-foundation-*"
+          - Sid: ConsoleServiceAndImages
+            Effect: Deny
+            NotAction: ["ecs:Describe*", "ecs:List*", "ecr:Describe*", "ecr:List*", "ecr:BatchGet*",
+                        "ecr:BatchCheck*", "ecr:GetDownloadUrlForLayer", "ecr:GetRepositoryPolicy",
+                        "codebuild:BatchGet*", "codebuild:List*", "scheduler:Get*", "scheduler:List*",
+                        "sns:Get*", "sns:List*"]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${AppName}-${Environment}"
+              - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${AppName}-${Environment}/*"
+              - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${AppName}-${Environment}/*"
+              - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AppName}-console:*"
+              - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AppName}-learning-loop:*"
+              - !Ref ConsoleRepositoryArn
+              - !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AppName}-console-build"
+              - !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${AppName}-learning-loop"
+              - !Ref AlarmTopic
+          - Sid: PlatformBuckets
+            Effect: Deny
+            NotAction: [s3:ListBucket, s3:GetBucketLocation, s3:GetObject, s3:GetObjectVersion]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*"
+              - !Sub "arn:${AWS::Partition}:s3:::${KnowledgeBucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${KnowledgeBucketName}/*"
+          - Sid: PlatformLogsAndAlarms
+            Effect: Deny
+            NotAction: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams,
+                        logs:DescribeLogGroups, "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*"]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${AppName}/*"
+              - !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AppName}-app-*"
+              - !Sub "arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/${AppName}-${Environment}"
+          - Sid: ConsoleEdgeAndLoadBalancer
+            Effect: Deny
+            NotAction: ["cloudfront:Get*", "cloudfront:List*", "elasticloadbalancing:Describe*",
+                        "wafv2:Get*", "wafv2:List*"]
+            Resource:
+              - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+              - !Ref LoadBalancer
+              - !Ref ConsoleTargetGroup
+              - !Sub
+                - "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener*/${Name}/*"
+                - {Name: !GetAtt LoadBalancer.LoadBalancerFullName}
+              - !Sub "arn:${AWS::Partition}:wafv2:us-east-1:${AWS::AccountId}:global/webacl/${AppName}-console/*"
+          - Sid: ConsoleNetwork
+            Effect: Deny
+            Action: "ec2:*"
+            Resource: "*"
+            # Only actions on resources inside the console's VPC carry this key, so
+            # describing things and working in other VPCs are unaffected.
+            Condition:
+              ArnEquals:
+                "ec2:Vpc": !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Vpc}"
+
+  # Keeps its original logical id and name so existing deployments update in place.
   AgentRuntime:
     Type: AWS::BedrockAgentCore::Runtime
     Properties:
       AgentRuntimeName: !Sub "${AppName}_agent"
-      Description: CloudOps action agent
+      Description: CloudOps executor - runs approved actions exactly as recorded; no model
       RoleArn: !GetAtt AgentRuntimeRole.Arn
       AgentRuntimeArtifact:
         CodeConfiguration:
@@ -195,19 +482,23 @@ Resources:
         MaxLifetime: 28800
       EnvironmentVariables:
         CLOUDOPS_ENV: !Ref Environment
+        RUNTIME_MODE: executor
         TICKETS_TABLE: !Ref TicketsTableName
         AUDIT_TABLE: !Ref AuditTableName
         ACTIONS_TABLE: !Ref ActionsTableName
         ACCOUNTS_TABLE: !Ref AccountsTableName
         USAGE_TABLE: !Ref UsageTableName
+        JOBS_TABLE: !Ref JobsTableName
+        CONVERSATIONS_TABLE: !Ref ConversationsTableName
         ARTIFACT_BUCKET: !Ref ArtifactBucketName
-        AGENT_MODEL_ID: !Ref AgentModelId
-        ROUTER_MODEL_ID: !Ref RouterModelId
-        BUILD_MODEL_ID: !Ref BuildModelId
+        KB_BUCKET: !Ref KnowledgeBucketName
         CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
-        CROSS_ACCOUNT_EXTERNAL_ID: !Ref CrossAccountExternalId
+        # Secrets are fetched at run time; a runtime's plain environment is readable through the API.
+        CROSS_ACCOUNT_EXTERNAL_ID_SECRET_ARN: !Ref ExternalIdSecretArn
+        IDENTITY_SIGNING_KEY_SECRET_ARN: !Ref IdentityKeySecretArn
         REQUIRE_SEPARATE_APPROVER: !Ref RequireSeparateApprover
-        DAILY_REQUEST_LIMIT_PER_TENANT: !Ref DailyRequestLimitPerTenant
+        PLATFORM_TENANTS: !Ref PlatformTenants
+        PROTECTED_RESOURCE_NAMES: !Sub "${UserPoolId},${AppName}_agent,${AppName}_planner,${AppName}-foundation,${AppName}-app,${AppName}/"
       Tags:
         App: !Ref AppName
 
@@ -398,7 +689,8 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: [!Ref CookieSecretArn, !Ref OidcClientSecret]
+                Resource: [!Ref CookieSecretArn, !Ref OidcClientSecret, !Ref ExternalIdSecretArn,
+                           !Ref IdentityKeySecretArn]
 
   ConsoleTaskRole:
     Type: AWS::IAM::Role
@@ -417,7 +709,11 @@ Resources:
               - Sid: InvokeAgent
                 Effect: Allow
                 Action: bedrock-agentcore:InvokeAgentRuntime
-                Resource: [!GetAtt AgentRuntime.AgentRuntimeArn, !Sub "${AgentRuntime.AgentRuntimeArn}/*"]
+                Resource:
+                  - !GetAtt PlannerRuntime.AgentRuntimeArn
+                  - !Sub "${PlannerRuntime.AgentRuntimeArn}/*"
+                  - !GetAtt AgentRuntime.AgentRuntimeArn
+                  - !Sub "${AgentRuntime.AgentRuntimeArn}/*"
               - Sid: Tables
                 Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
@@ -472,8 +768,11 @@ Resources:
           Environment:
             - {Name: CLOUDOPS_ENV, Value: !Ref Environment}
             - {Name: AUTH_MODE, Value: oidc}
-            - {Name: AGENT_RUNTIME_ARN, Value: !GetAtt AgentRuntime.AgentRuntimeArn}
-            - {Name: AGENT_RUNTIME_ROLE_ARN, Value: !GetAtt AgentRuntimeRole.Arn}
+            - {Name: PLANNER_RUNTIME_ARN, Value: !GetAtt PlannerRuntime.AgentRuntimeArn}
+            - {Name: EXECUTOR_RUNTIME_ARN, Value: !GetAtt AgentRuntime.AgentRuntimeArn}
+            - {Name: PLANNER_RUNTIME_ROLE_ARN, Value: !GetAtt PlannerRuntimeRole.Arn}
+            - {Name: EXECUTOR_RUNTIME_ROLE_ARN, Value: !GetAtt AgentRuntimeRole.Arn}
+            - {Name: PLATFORM_TENANTS, Value: !Ref PlatformTenants}
             - {Name: TICKETS_TABLE, Value: !Ref TicketsTableName}
             - {Name: AUDIT_TABLE, Value: !Ref AuditTableName}
             - {Name: ACTIONS_TABLE, Value: !Ref ActionsTableName}
@@ -485,7 +784,6 @@ Resources:
             - {Name: KNOWLEDGE_BASE_ID, Value: !Ref KnowledgeBaseId}
             - {Name: DATA_SOURCE_ID, Value: !Ref DataSourceId}
             - {Name: CROSS_ACCOUNT_ROLE_NAME, Value: !Ref CrossAccountRoleName}
-            - {Name: CROSS_ACCOUNT_EXTERNAL_ID, Value: !Ref CrossAccountExternalId}
             - {Name: REQUIRE_SEPARATE_APPROVER, Value: !Ref RequireSeparateApprover}
             - {Name: OIDC_CLIENT_ID, Value: !Ref OidcClient}
             - {Name: OIDC_METADATA_URL, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration"}
@@ -497,6 +795,8 @@ Resources:
           Secrets:
             - {Name: OIDC_CLIENT_SECRET, ValueFrom: !Ref OidcClientSecret}
             - {Name: OIDC_COOKIE_SECRET, ValueFrom: !Ref CookieSecretArn}
+            - {Name: CROSS_ACCOUNT_EXTERNAL_ID, ValueFrom: !Ref ExternalIdSecretArn}
+            - {Name: IDENTITY_SIGNING_KEY, ValueFrom: !Ref IdentityKeySecretArn}
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -675,8 +975,11 @@ Resources:
           Environment:
             - {Name: CLOUDOPS_ENV, Value: !Ref Environment}
             - {Name: AUTH_MODE, Value: oidc}
-            - {Name: AGENT_RUNTIME_ARN, Value: !GetAtt AgentRuntime.AgentRuntimeArn}
-            - {Name: AGENT_RUNTIME_ROLE_ARN, Value: !GetAtt AgentRuntimeRole.Arn}
+            - {Name: PLANNER_RUNTIME_ARN, Value: !GetAtt PlannerRuntime.AgentRuntimeArn}
+            - {Name: EXECUTOR_RUNTIME_ARN, Value: !GetAtt AgentRuntime.AgentRuntimeArn}
+            - {Name: PLANNER_RUNTIME_ROLE_ARN, Value: !GetAtt PlannerRuntimeRole.Arn}
+            - {Name: EXECUTOR_RUNTIME_ROLE_ARN, Value: !GetAtt AgentRuntimeRole.Arn}
+            - {Name: PLATFORM_TENANTS, Value: !Ref PlatformTenants}
             - {Name: TICKETS_TABLE, Value: !Ref TicketsTableName}
             - {Name: AUDIT_TABLE, Value: !Ref AuditTableName}
             - {Name: ACTIONS_TABLE, Value: !Ref ActionsTableName}
@@ -688,7 +991,6 @@ Resources:
             - {Name: KNOWLEDGE_BASE_ID, Value: !Ref KnowledgeBaseId}
             - {Name: DATA_SOURCE_ID, Value: !Ref DataSourceId}
             - {Name: CROSS_ACCOUNT_ROLE_NAME, Value: !Ref CrossAccountRoleName}
-            - {Name: CROSS_ACCOUNT_EXTERNAL_ID, Value: !Ref CrossAccountExternalId}
             - {Name: REQUIRE_SEPARATE_APPROVER, Value: !Ref RequireSeparateApprover}
             - {Name: OIDC_CLIENT_ID, Value: !Ref OidcClient}
             - {Name: OIDC_METADATA_URL, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}/.well-known/openid-configuration"}
@@ -852,6 +1154,9 @@ Outputs:
   ConsoleUrl:
     Value: !Sub ["https://${Host}", {Host: !If [HasDomain, !Ref DomainName, !GetAtt Distribution.DomainName]}]
   CloudFrontDomainName: {Value: !GetAtt Distribution.DomainName}
+  PlannerRuntimeArn: {Value: !GetAtt PlannerRuntime.AgentRuntimeArn}
+  PlannerRuntimeRoleArn: {Value: !GetAtt PlannerRuntimeRole.Arn}
+  # The executor keeps the original output names.
   AgentRuntimeArn: {Value: !GetAtt AgentRuntime.AgentRuntimeArn}
   AgentRuntimeRoleArn: {Value: !GetAtt AgentRuntimeRole.Arn}
   ClusterName: {Value: !Ref Cluster}

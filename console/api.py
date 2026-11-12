@@ -13,6 +13,7 @@ import config
 from console.auth import require_user
 from console.jobs import JobStore
 from src.agents.gateway import AgentGateway
+from src.core import tenancy
 from src.core.accounts import AccountRegistry
 from src.core.security import Permission, User, security_manager
 from src.services.app_bundles import AppBundleStore, BundleError
@@ -203,7 +204,8 @@ async def upload(file: UploadFile = File(...), target: str = Form("auto"), optio
 
 @router.get("/accounts")
 def list_accounts(user: User = Depends(require_user)):
-    return sorted(registry().list().values(), key=lambda a: (a.get("name") or "", a["account_id"]))
+    return sorted(registry().list(user.tenant_id).values(),
+                  key=lambda a: (a.get("name") or "", a["account_id"]))
 
 
 class NewAccount(BaseModel):
@@ -215,7 +217,7 @@ class NewAccount(BaseModel):
 def add_account(body: NewAccount, user: User = Depends(require_user)):
     need(user, Permission.MANAGE_ACCOUNTS)
     try:
-        item = registry().add(body.account_id, body.name, user.user_id)
+        item = registry().add(body.account_id, body.name, user.user_id, user.tenant_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     security_manager.log_audit_event(user.user_id, user.tenant_id, "account_added", item["account_id"],
@@ -226,7 +228,8 @@ def add_account(body: NewAccount, user: User = Depends(require_user)):
 @router.delete("/accounts/{account_id}")
 def remove_account(account_id: str, user: User = Depends(require_user)):
     need(user, Permission.MANAGE_ACCOUNTS)
-    registry().remove(account_id)
+    if not registry().remove(account_id, user.tenant_id):
+        raise HTTPException(status_code=404, detail="Account not found.")
     security_manager.log_audit_event(user.user_id, user.tenant_id, "account_removed", account_id, "SUCCESS")
     return {"ok": True}
 
@@ -240,12 +243,14 @@ def test_account(account_id: str, user: User = Depends(require_user)):
 @router.get("/accounts/setup")
 def account_setup(user: User = Depends(require_user)):
     need(user, Permission.MANAGE_ACCOUNTS)
-    role_arn = os.environ.get("AGENT_RUNTIME_ROLE_ARN", "<agent-runtime-role-arn>")
-    external_id = config.CROSS_ACCOUNT_EXTERNAL_ID or "<external-id>"
+    executor = os.environ.get("EXECUTOR_RUNTIME_ROLE_ARN", "<executor-runtime-role-arn>")
+    planner = os.environ.get("PLANNER_RUNTIME_ROLE_ARN", "<planner-runtime-role-arn>")
+    external_id = tenancy.external_id_for(user.tenant_id) or "<external-id>"
     return {"command": (
         "aws cloudformation deploy --template-file infra/cross_account_role.yaml "
         "--stack-name cloudops-cross-account --capabilities CAPABILITY_NAMED_IAM "
-        f"--parameter-overrides AgentRuntimeRoleArn={role_arn} ExternalId={external_id}"
+        f"--parameter-overrides PlannerRuntimeRoleArn={planner} AgentRuntimeRoleArn={executor} "
+        f"ExternalId={external_id}"
     )}
 
 

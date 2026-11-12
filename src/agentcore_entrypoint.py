@@ -28,6 +28,7 @@ from src.agents.router import DomainRouter
 from src.core.account_scope import AccountDirectory, scope_tools
 from src.core.accounts import AccountRegistry
 from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating
+from src.core import identity, tenancy
 from src.core.aws_clients import base_account_id, boto3, use_account
 from src.core import request_context
 from src.core.monitoring import configure_logging, metrics
@@ -543,6 +544,12 @@ def invoke(payload: dict) -> dict:
           "action_ids": [...]
         }
     """
+    try:
+        identity.verify(payload)
+    except identity.IdentityError as e:
+        logger.warning("request_rejected", reason=str(e))
+        return {"response": f"Request rejected: {e}", "error": "Unauthorized",
+                "session_id": payload.get("session_id", "")}
     caller = _caller(payload)
     structlog.contextvars.bind_contextvars(
         tenant_id=caller["tenant_id"], user_id=caller["user_id"],
@@ -566,6 +573,13 @@ def invoke(payload: dict) -> dict:
 
 
 def _dispatch(mode: str, payload: dict, caller: dict) -> dict:
+    # The planner runtime (model, read-only credentials) never executes changes and
+    # the executor runtime (write credentials) never runs a model.
+    allowed = {"planner": ("chat", "check_account"), "executor": ("execute", "check_account")}.get(
+        config.RUNTIME_MODE, ("chat", "execute", "check_account"))
+    if mode in ("chat", "execute", "check_account") and mode not in allowed:
+        return {"response": f"This runtime ({config.RUNTIME_MODE}) does not handle '{mode}' requests.",
+                "error": "WrongRuntime"}
     if mode == "execute":
         return _execute(payload, caller)
     if mode == "check_account":
@@ -608,10 +622,12 @@ def _chat(payload: dict, caller: dict) -> dict:
 
     # One agent run works across accounts: every tool takes an `account` argument,
     # resolved against the registered accounts (see src/core/account_scope.py).
-    registered = {a: info.get("name") or a for a, info in account_registry.list().items()}
+    registered = {a: info.get("name") or a
+                  for a, info in account_registry.list(caller["tenant_id"]).items()}
     selected, refused = _selected_accounts(payload, set(registered))
     directory = AccountDirectory(base_account_id(), registered,
-                                 default=selected[0] if len(selected) == 1 else None, region=region)
+                                 default=selected[0] if len(selected) == 1 else None, region=region,
+                                 platform_allowed=tenancy.platform_allowed(caller["tenant_id"]))
     refused += [a for a in directory.unregistered_ids_in(payload.get("user_message") or prompt)
                 if a not in refused]
 
@@ -827,16 +843,22 @@ def _execute(payload: dict, caller: dict) -> dict:
     def audit(**kwargs):
         security_manager.log_audit_event(caller["user_id"], caller["tenant_id"], **kwargs)
 
+    # The account must still be this tenant's when the change runs, not only when it was proposed.
+    registered = set(account_registry.list(caller["tenant_id"]))
+
+    def account_allowed(account_id) -> bool:
+        return account_id in registered if account_id else tenancy.platform_allowed(caller["tenant_id"])
+
     results = execute_actions(
         action_ids, tenant_id=caller["tenant_id"], approver=caller["user_id"],
         approver_role=caller["role"].value, tools=TOOL_REGISTRY, store=action_store, audit=audit,
-        stop_on_failure=bool(payload.get("stop_on_failure")),
+        stop_on_failure=bool(payload.get("stop_on_failure")), account_allowed=account_allowed,
     )
     lines = []
     for r in results:
         metrics.action(r["status"])
         icon = {"succeeded": "✅", "failed": "❌", "skipped": "⏭️"}.get(r["status"], "⚠️")
-        where = f" in {_account_name(r.get('account_id'))}"
+        where = f" in {_account_name(r.get('account_id'), caller['tenant_id'])}"
         detail = r.get("error") or _result_headline(r.get("result"))
         lines.append(f"{icon} {r.get('summary', r['action_id'])}{where}: {r['status']}"
                      + (f" — {detail}" if detail else ""))
@@ -850,6 +872,8 @@ def _check_account(payload: dict, caller: dict) -> dict:
     account_id = str(payload.get("account_id", ""))
     if not _ACCOUNT_ID_RE.fullmatch(account_id):
         return {"ok": False, "response": "Invalid account id.", "error": "BadRequest"}
+    if not account_registry.is_allowed(account_id, caller["tenant_id"]):
+        return {"ok": False, "response": "Register the account before testing it.", "error": "BadRequest"}
     try:
         with use_account(account_id):
             arn = boto3.client("sts").get_caller_identity()["Arn"]
@@ -859,11 +883,11 @@ def _check_account(payload: dict, caller: dict) -> dict:
                                          f"{account_id}: {e}"}
 
 
-def _account_name(account_id) -> str:
+def _account_name(account_id, tenant_id=None) -> str:
     if not account_id:
         return "the platform account"
     try:
-        name = account_registry.name_of(account_id)
+        name = account_registry.name_of(account_id, tenant_id)
     except Exception:
         name = None
     return f"{name} ({account_id})" if name and name != account_id else account_id

@@ -1,17 +1,25 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CloudOps cross-account access. Deploy in every AWS account the CloudOps agent
-  should manage (or across an AWS Organization as a StackSet). Creates the role
-  the agent assumes plus, optionally, the service roles its deploy tools use.
-  The platform's values for both required parameters are shown on the console's
-  Accounts page and printed by scripts/deploy.py.
+  should manage (or across an AWS Organization as a StackSet). Creates two roles:
+  a read-only one for the planner (the part of the agent that talks to the
+  model) and one for the executor (which runs changes a person approved), plus,
+  optionally, the service roles the deploy tools use. The platform's values for
+  the required parameters are shown on the console's Accounts page and printed
+  by scripts/deploy.py.
 
 Parameters:
+  PlannerRuntimeRoleArn:
+    Type: String
+    Description: >
+      ARN of the IAM role the CloudOps planner runtime runs as in the platform
+      account (app stack output PlannerRuntimeRoleArn). It gets read-only access.
+    AllowedPattern: "^arn:aws:iam::\\d{12}:role/.+$"
   AgentRuntimeRoleArn:
     Type: String
     Description: >
-      ARN of the IAM role the CloudOps agent runtime runs as in the platform
-      account (app stack output AgentRuntimeRoleArn).
+      ARN of the IAM role the CloudOps executor runtime runs as in the platform
+      account (app stack output AgentRuntimeRoleArn). It runs approved changes.
     AllowedPattern: "^arn:aws:iam::\\d{12}:role/.+$"
   ExternalId:
     Type: String
@@ -23,7 +31,11 @@ Parameters:
   RoleName:
     Type: String
     Default: CloudOpsCrossAccountRole
-    Description: Must match CROSS_ACCOUNT_ROLE_NAME in config.py.
+    Description: Executor role; must match the app stack's CrossAccountRoleName.
+  ReadRoleName:
+    Type: String
+    Default: CloudOpsCrossAccountReadRole
+    Description: Planner role; must match the app stack's CrossAccountReadRoleName.
   AccessLevel:
     Type: String
     Default: PowerUser
@@ -44,11 +56,42 @@ Conditions:
   MakeDeploymentRoles: !Equals [!Ref CreateDeploymentRoles, "true"]
 
 Resources:
+  # What the model can use: read-only, whatever AccessLevel is.
+  CrossAccountReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ReadRoleName
+      Description: Assumed by the CloudOps planner to inspect this account (read-only).
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref PlannerRuntimeRoleArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: ValidateTemplates
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+      Tags:
+        - Key: ManagedBy
+          Value: CloudOps
+
   CrossAccountRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Ref RoleName
-      Description: Assumed by the CloudOps agent to act in this account.
+      Description: Assumed by the CloudOps executor to run approved changes in this account.
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -202,5 +245,7 @@ Resources:
       Roles: [!Ref Ec2SsmRole]
 
 Outputs:
+  CrossAccountReadRoleArn:
+    Value: !GetAtt CrossAccountReadRole.Arn
   CrossAccountRoleArn:
     Value: !GetAtt CrossAccountRole.Arn

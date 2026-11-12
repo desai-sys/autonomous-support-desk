@@ -34,10 +34,15 @@ class AccountDirectory:
     """The accounts one request may use: the platform account plus registered ones."""
 
     def __init__(self, platform_id: Optional[str], registered: Dict[str, str],
-                 default: Optional[str] = None, region: Optional[str] = None):
+                 default: Optional[str] = None, region: Optional[str] = None,
+                 platform_allowed: bool = True):
         self.platform_id = platform_id
         self.registered = {a: (n or a) for a, n in registered.items() if a != platform_id}
+        self.platform_allowed = platform_allowed
         self.default = default if default in self.registered else None
+        # A tenant without the platform account and with exactly one account means that one.
+        if self.default is None and not platform_allowed and len(self.registered) == 1:
+            self.default = next(iter(self.registered))
         self.region = region
         self.used: Dict[Optional[str], str] = {}
 
@@ -53,13 +58,20 @@ class AccountDirectory:
         else:
             matches = [a for a, n in self.registered.items() if n.lower() == text.lower()]
             if len(matches) != 1:
-                raise UnknownAccount(
-                    f"Unknown account {text!r}. Use one of: platform, "
-                    + ", ".join(f"{n} ({a})" for a, n in self.registered.items())
-                    + ". Other accounts must be registered by an admin first.")
+                raise UnknownAccount(f"Unknown account {text!r}. Use one of: {self._choices()}. "
+                                     f"Other accounts must be registered by an admin first.")
             account = matches[0]
+        if account is None and not self.platform_allowed:
+            raise UnknownAccount(
+                "The platform account is not available to this organisation. "
+                + (f"Pass `account` as one of: {self._choices()}." if self.registered
+                   else "An admin must register an account on the Accounts page first."))
         self.used[account] = self.label(account)
         return account
+
+    def _choices(self) -> str:
+        names = ["platform"] if self.platform_allowed else []
+        return ", ".join(names + [f"{n} ({a})" for a, n in self.registered.items()])
 
     def label(self, account: Optional[str]) -> str:
         if account is None:
@@ -73,11 +85,15 @@ class AccountDirectory:
     def prompt_note(self) -> str:
         lines = ["ACCOUNTS: every tool has an optional `account` parameter. Pass the account to run "
                  "each call in; one request may use several accounts (e.g. compare them, or peer VPCs "
-                 "across them). Available accounts:",
-                 f"- platform — {self.label(None)}"]
+                 "across them). Available accounts:"]
+        if self.platform_allowed:
+            lines.append(f"- platform — {self.label(None)}")
         lines += [f"- {n} — {a}" for a, n in self.registered.items()]
-        lines.append(f"If `account` is omitted the call runs in {self.label(self.default)}, the "
-                     f"operator's selected default.")
+        if self.default is not None or self.platform_allowed:
+            lines.append(f"If `account` is omitted the call runs in {self.label(self.default)}, the "
+                         f"operator's selected default.")
+        else:
+            lines.append("There is no default account: always pass `account`.")
         lines.append("Only state facts about an account after calling a tool in THAT account during "
                      "this turn; never infer one account's state from another's. Label results by "
                      "account.")
@@ -140,7 +156,10 @@ def resolve_account_ref(ref: Any) -> Optional[str]:
     Uses the account registry, so it works both while proposing and when an approved
     action is executed later.
     """
+    from src.core import request_context, tenancy
     from src.core.accounts import AccountRegistry
     from src.core.aws_clients import base_account_id
-    registered = {a: info.get("name") or a for a, info in AccountRegistry().list().items()}
-    return AccountDirectory(base_account_id(), registered).resolve(ref or "platform")
+    tenant = request_context.tenant_id()
+    registered = {a: info.get("name") or a for a, info in AccountRegistry().list(tenant).items()}
+    return AccountDirectory(base_account_id(), registered,
+                            platform_allowed=tenancy.platform_allowed(tenant)).resolve(ref or "platform")

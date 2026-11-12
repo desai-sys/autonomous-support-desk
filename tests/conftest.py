@@ -10,6 +10,9 @@ os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("ARTIFACT_BUCKET", "cloudops-artifacts-test")
+# Tests sign in through the development form and use tenant "t1" as a platform tenant.
+os.environ.setdefault("AUTH_MODE", "local")
+os.environ.setdefault("PLATFORM_TENANTS", "default,t1")
 
 
 @pytest.fixture
@@ -53,7 +56,7 @@ def tables(aws):
         "${AppName}-tickets": config.TICKETS_TABLE, "${AppName}-audit": config.AUDIT_TABLE,
         "${AppName}-actions": config.ACTIONS_TABLE, "${AppName}-accounts": config.ACCOUNTS_TABLE,
         "${AppName}-usage": config.USAGE_TABLE,
-        "${AppName}-jobs": config.JOBS_TABLE,
+        "${AppName}-jobs": config.JOBS_TABLE, "${AppName}-conversations": config.CONVERSATIONS_TABLE,
     }
     ddb = boto3.client("dynamodb", region_name="us-east-1")
     for props in _foundation_tables():
