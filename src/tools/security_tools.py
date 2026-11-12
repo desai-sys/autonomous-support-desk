@@ -36,7 +36,7 @@ def analyze_iam_user(username: str) -> str:
         inline_policies = inline_policies_response['PolicyNames']
         
         # Get groups
-        groups_response = iam.get_groups_for_user(UserName=username)
+        groups_response = iam.list_groups_for_user(UserName=username)
         groups = [group['GroupName'] for group in groups_response['Groups']]
         
         # Get access keys
@@ -116,7 +116,11 @@ def analyze_iam_role(role_name: str) -> str:
         instance_profiles = [profile['InstanceProfileName'] for profile in instance_profiles_response['InstanceProfiles']]
         
         # Parse trust policy
-        trust_policy = json.loads(role['AssumeRolePolicyDocument'].replace('%20', ' ').replace('%22', '"').replace('%7B', '{').replace('%7D', '}'))
+        # boto3 returns the trust policy already decoded; older responses were URL-encoded JSON.
+        trust_policy = role['AssumeRolePolicyDocument']
+        if isinstance(trust_policy, str):
+            from urllib.parse import unquote
+            trust_policy = json.loads(unquote(trust_policy))
         
         trusted_entities = []
         for statement in trust_policy.get('Statement', []):
@@ -243,9 +247,9 @@ def analyze_secrets_manager_secret(secret_name: str) -> str:
         versions_response = secrets.list_secret_version_ids(SecretId=secret_name)
         
         versions = []
-        for version_id, version_info in versions_response['Versions'].items():
+        for version_info in versions_response.get('Versions', []):
             versions.append({
-                'version_id': version_id,
+                'version_id': version_info.get('VersionId'),
                 'version_stages': version_info.get('VersionStages', []),
                 'created_date': version_info.get('CreatedDate', '').isoformat() if version_info.get('CreatedDate') else None,
                 'last_accessed_date': version_info.get('LastAccessedDate', '').isoformat() if version_info.get('LastAccessedDate') else None
@@ -278,12 +282,10 @@ def rotate_secrets_manager_secret(secret_name: str, force_rotate: bool = False) 
     try:
         secrets = boto3.client('secretsmanager', region_name='us-east-1')
         
-        response = secrets.rotate_secret(
-            SecretId=secret_name,
-            ForceRotateSecretForTest=force_rotate
-        )
-        
-        return f"Initiated rotation for secret {secret_name}. Version ID: {response['VersionId']}"
+        # RotateImmediately=False only schedules the rotation; True rotates now.
+        response = secrets.rotate_secret(SecretId=secret_name, RotateImmediately=bool(force_rotate) or True)
+
+        return f"Initiated rotation for secret {secret_name}. Version ID: {response.get('VersionId', 'pending')}"
         
     except Exception as e:
         return f"Error rotating secret: {str(e)}"
@@ -334,9 +336,9 @@ def analyze_kms_key(key_id: str) -> str:
         analysis = {
             'key_id': key['KeyId'],
             'arn': key['Arn'],
-            'description': key['Description'],
-            'key_usage': key['KeyUsage'],
-            'key_spec': key['KeySpec'],
+            'description': key.get('Description', ''),
+            'key_usage': key.get('KeyUsage', 'N/A'),
+            'key_spec': key.get('KeySpec', 'N/A'),
             'key_state': key['KeyState'],
             'enabled': key['Enabled'],
             'creation_date': key['CreationDate'].isoformat(),
@@ -764,7 +766,7 @@ def list_kms_keys(region: str = 'us-east-1') -> str:
                             'key_id': meta['KeyId'],
                             'description': meta.get('Description', '')[:60],
                             'state': meta['KeyState'],
-                            'usage': meta['KeyUsage'],
+                            'usage': meta.get('KeyUsage', 'N/A'),
                             'created': meta['CreationDate'].isoformat()[:10],
                         })
                 except Exception:

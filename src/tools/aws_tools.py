@@ -2168,48 +2168,6 @@ def list_timestream_tables(database_name: str, region: str = 'us-east-1') -> str
 
 
 # ============================================================================
-# QLDB Tools
-# ============================================================================
-
-@tool
-def list_qldb_ledgers(region: str = 'us-east-1') -> str:
-    """List all QLDB ledgers."""
-    try:
-        qldb = boto3.client('qldb', region_name=region)
-        response = qldb.list_ledgers()
-        ledgers = []
-        for l in response['Ledgers']:
-            ledgers.append({
-                'name': l['Name'],
-                'state': l['State'],
-                'created': l['CreationDateTime'].isoformat(),
-            })
-        return f"Found {len(ledgers)} QLDB ledger(s):\n" + json.dumps(ledgers, indent=2, default=str)
-    except Exception as e:
-        return f"Error listing QLDB ledgers: {str(e)}"
-
-
-@tool
-def analyze_qldb_ledger(ledger_name: str) -> str:
-    """Analyze a QLDB ledger including permissions mode and export configuration."""
-    try:
-        qldb = boto3.client('qldb', region_name='us-east-1')
-        response = qldb.describe_ledger(Name=ledger_name)
-        analysis = {
-            'name': ledger_name,
-            'arn': response['Arn'],
-            'state': response['State'],
-            'permissions_mode': response['PermissionsMode'],
-            'deletion_protection': response.get('DeletionProtection', True),
-            'encryption_description': response.get('EncryptionDescription', {}),
-            'created': response['CreationDateTime'].isoformat(),
-        }
-        return f"QLDB Ledger Analysis for {ledger_name}:\n" + json.dumps(analysis, indent=2, default=str)
-    except Exception as e:
-        return f"Error analyzing QLDB ledger: {str(e)}"
-
-
-# ============================================================================
 # DMS (Database Migration Service) Tools
 # ============================================================================
 
@@ -3026,7 +2984,10 @@ def analyze_batch_job_queue(job_queue_name: str) -> str:
     """Analyze a Batch job queue including pending, running, and failed job counts."""
     try:
         batch = boto3.client('batch', region_name='us-east-1')
-        queue = batch.describe_job_queues(jobQueues=[job_queue_name])['jobQueues'][0]
+        queues = batch.describe_job_queues(jobQueues=[job_queue_name])['jobQueues']
+        if not queues:
+            return f"Batch job queue '{job_queue_name}' not found."
+        queue = queues[0]
         job_counts = {}
         for status in ['SUBMITTED', 'PENDING', 'RUNNABLE', 'STARTING', 'RUNNING', 'SUCCEEDED', 'FAILED']:
             jobs = batch.list_jobs(jobQueue=job_queue_name, jobStatus=status)
@@ -3718,7 +3679,7 @@ DATABASE
   • Manage ElastiCache and DocumentDB clusters
   • Manage Redshift clusters (pause/resume)
   • Manage Neptune, OpenSearch Service, OpenSearch Serverless
-  • Manage Glue ETL jobs, Athena queries, Timestream, QLDB
+  • Manage Glue ETL jobs, Athena queries, Timestream
   • Manage DMS migration tasks
 
 SECURITY

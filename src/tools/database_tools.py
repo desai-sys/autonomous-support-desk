@@ -86,7 +86,7 @@ def analyze_rds_instance(db_instance_id: str) -> str:
             'storage_type': instance['StorageType'],
             'storage_encrypted': instance['StorageEncrypted'],
             'multi_az': instance['MultiAZ'],
-            'publicly_accessible': instance['PubliclyAccessible'],
+            'publicly_accessible': instance.get('PubliclyAccessible', False),
             'endpoint': instance.get('Endpoint', {}).get('Address', 'N/A'),
             'port': instance.get('Endpoint', {}).get('Port', 'N/A'),
             'vpc_id': instance.get('DBSubnetGroup', {}).get('VpcId', 'N/A'),

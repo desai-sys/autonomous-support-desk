@@ -109,6 +109,9 @@ def analyze_s3_bucket(bucket_name: str) -> str:
         except:
             object_count = 0
         
+        # Same rules as the public-bucket scan (account and bucket Block Public Access, policy status, ACLs).
+        exposure = _bucket_exposure(bucket_name, *_account_public_access_block())
+
         analysis = {
             'bucket_name': bucket_name,
             'region': location,
@@ -120,7 +123,8 @@ def analyze_s3_bucket(bucket_name: str) -> str:
             'encryption_enabled': encryption is not None,
             'lifecycle_rules_count': len(lifecycle),
             'public_access_block': public_access,
-            'is_public': self._check_bucket_public_access(bucket_name, public_access, has_policy)
+            'is_public': exposure['public'],
+            'public_exposure_reasons': exposure['reasons'],
         }
         
         return f"S3 Bucket Analysis for {bucket_name}:\n" + json.dumps(analysis, indent=2, default=str)
@@ -303,8 +307,10 @@ def analyze_ebs_volume(volume_id: str) -> str:
                 if metric_response['Datapoints']:
                     latest = max(metric_response['Datapoints'], key=lambda x: x['Timestamp'])
                     metrics[metric_name] = latest
-            except:
-                metrics[metric_name] = {'Sum': 0, 'Average': 0}
+            except Exception:
+                pass
+            # An idle volume has no datapoints for the hour.
+            metrics.setdefault(metric_name, {'Sum': 0, 'Average': 0})
         
         analysis = {
             'volume_id': volume_id,
@@ -418,7 +424,7 @@ def list_ebs_snapshots(volume_id: str = None, max_results: int = 50) -> str:
                 'progress': snapshot['Progress'],
                 'start_time': snapshot['StartTime'].isoformat(),
                 'volume_size': snapshot['VolumeSize'],
-                'description': snapshot['Description']
+                'description': snapshot.get('Description', '')
             })
         
         result = {
@@ -530,22 +536,6 @@ def create_efs_access_point(filesystem_id: str, path: str, uid: int = 1000, gid:
         
     except Exception as e:
         return f"Error creating EFS access point: {str(e)}"
-
-
-def _check_bucket_public_access(bucket_name: str, public_access_block: dict, has_policy: bool) -> bool:
-    """Helper function to determine if S3 bucket might be public."""
-    if not public_access_block:
-        return True  # No public access block means potentially public
-    
-    # If all public access is blocked, bucket is not public
-    if (public_access_block.get('BlockPublicAcls', False) and
-        public_access_block.get('IgnorePublicAcls', False) and
-        public_access_block.get('BlockPublicPolicy', False) and
-        public_access_block.get('RestrictPublicBuckets', False)):
-        return False
-    
-    # If there's a bucket policy and public access isn't fully blocked, might be public
-    return has_policy
 
 
 # ============================================================================

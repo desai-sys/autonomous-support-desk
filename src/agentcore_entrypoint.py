@@ -135,7 +135,6 @@ from src.tools.aws_tools import (
     pause_redshift_cluster, resume_redshift_cluster,
     list_neptune_clusters, analyze_neptune_cluster,
     list_timestream_databases, list_timestream_tables,
-    list_qldb_ledgers, analyze_qldb_ledger,
     list_dms_tasks, analyze_dms_task, start_dms_task, stop_dms_task,
     list_transfer_servers, analyze_transfer_server,
     list_datasync_tasks, analyze_datasync_task, start_datasync_task,
@@ -257,7 +256,7 @@ DOMAIN_INTROS = {
     ),
     "database": (
         "You are an AWS Database specialist. You manage RDS, DynamoDB, ElastiCache, DocumentDB, "
-        "Redshift, Neptune, OpenSearch, Glue, Athena, Timestream, QLDB, and DMS. Use list_ tools "
+        "Redshift, Neptune, OpenSearch, Glue, Athena, Timestream, and DMS. Use list_ tools "
         "first; mention backup status and storage encryption when analyzing databases."
     ),
     "security": (
@@ -406,7 +405,6 @@ TOOLS_DATABASE = [
     list_glue_jobs, analyze_glue_job, start_glue_job, stop_glue_job, get_glue_job_run,
     list_athena_workgroups, start_athena_query, get_athena_query_results,
     list_timestream_databases, list_timestream_tables,
-    list_qldb_ledgers, analyze_qldb_ledger,
     list_dms_tasks, analyze_dms_task, start_dms_task, stop_dms_task,
     search_resource_by_name,
     describe_agent_capabilities,
