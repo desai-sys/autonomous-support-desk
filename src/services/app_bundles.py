@@ -147,8 +147,20 @@ class AppBundleStore:
                     if (m := re.search(r"/v(\d+)/$", p["Prefix"]))]
         return max(versions, default=0)
 
+    def list_apps(self, tenant: str, limit: int = 30) -> List[dict]:
+        """The latest manifest of each of the tenant's apps."""
+        resp = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=f"apps/{tenant}/", Delimiter="/")
+        apps = []
+        for entry in resp.get("CommonPrefixes", [])[:limit]:
+            app_id = entry["Prefix"].rstrip("/").rsplit("/", 1)[-1]
+            try:
+                apps.append(self.load(tenant, app_id)[0])
+            except (BundleError, KeyError, ValueError):
+                continue
+        return apps
+
     def save(self, tenant: str, app_id: str, description: str, files: Dict[str, str],
-             template: str, author: str) -> dict:
+             template: str, author: str, extra: Optional[dict] = None) -> dict:
         warnings = validate(app_id, files, template)
         version = self.latest_version(tenant, app_id) + 1
         prefix = self._prefix(tenant, app_id, version)
@@ -157,6 +169,7 @@ class AppBundleStore:
             "files": sorted(files), "has_code": code_zip(files) is not None,
             "created_by": author, "created_at": datetime.now(timezone.utc).isoformat(),
             "warnings": warnings,
+            **(extra or {}),
         }
         put = lambda key, body, ctype: self.s3.put_object(  # noqa: E731
             Bucket=self.bucket, Key=prefix + key, Body=body, ContentType=ctype,

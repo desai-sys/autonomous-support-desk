@@ -139,7 +139,7 @@ python evals/run_evals.py --offline
 ```
 
 ```bash
-ruff check . && mypy src/core console src/agents src/services src/jobs config.py
+ruff check . && mypy src/core console src/agents src/services src/jobs src/appbuilder config.py
 ```
 
 To run everything locally, see [Local development](docs/DEPLOYMENT.md#local-development).

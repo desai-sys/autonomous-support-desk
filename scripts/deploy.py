@@ -233,6 +233,17 @@ def cloudfront_prefix_list(session) -> str:
     return lists[0]["PrefixListId"]
 
 
+def generated_app_role_owner(session) -> str:
+    """Name of the stack that owns the cloudops-generated-app role ('' if the role doesn't exist)."""
+    iam = session.client("iam")
+    try:
+        iam.get_role(RoleName="cloudops-generated-app")
+    except ClientError:
+        return ""
+    tags = iam.list_role_tags(RoleName="cloudops-generated-app").get("Tags", [])
+    return next((t["Value"] for t in tags if t["Key"] == "aws:cloudformation:stack-name"), "another owner")
+
+
 def secret_value(session, arn: str) -> str:
     return session.client("secretsmanager").get_secret_value(SecretId=arn)["SecretString"]
 
@@ -295,7 +306,7 @@ def main() -> None:
     p.add_argument("--agent-model", default="us.amazon.nova-pro-v1:0")
     p.add_argument("--router-model", default="us.amazon.nova-micro-v1:0")
     p.add_argument("--build-model", default="",
-                   help="Model for the app builder (e.g. us.amazon.nova-premier-v1:0); default: --agent-model")
+                   help="Model the app builder writes code with; default: --agent-model")
     p.add_argument("--domain", default="", help="Custom console domain (needs --certificate-arn)")
     p.add_argument("--certificate-arn", default="", help="ACM certificate in us-east-1 for --domain")
     args = p.parse_args()
@@ -337,6 +348,8 @@ def main() -> None:
         "DailyRequestLimitPerTenant": args.daily_request_limit,
         "ConsoleDesiredCount": args.console_tasks,
         "OriginAccess": args.origin,
+        # One role per account: a second CloudOps stack in the same account reuses the first one's.
+        "CreateGeneratedAppRole": str(generated_app_role_owner(session) in ("", f"{app}-app")).lower(),
         "NatGateways": args.nat_gateways,
         "AlarmEmail": args.alarm_email,
         "DomainName": args.domain,
