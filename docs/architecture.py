@@ -95,26 +95,26 @@ STEPS = [
     "Operators sign in with Amazon Cognito managed login (OIDC, optional MFA). Cognito groups map to roles "
     "(viewer, operator, SRE, admin) and a protected attribute sets the tenant.",
     "The browser connects over HTTPS to Amazon CloudFront, where AWS WAF applies managed rule groups and rate limiting.",
-    "CloudFront forwards to an internet-facing Application Load Balancer that accepts only the CloudFront "
-    "prefix list and a secret origin header.",
+    "CloudFront reaches an internal Application Load Balancer through a VPC origin. The load balancer has no "
+    "public address and also requires a secret origin header.",
     "The ALB routes to the console (React + FastAPI) on Amazon ECS on AWS Fargate in private subnets across two "
-    "Availability Zones. Each chat turn runs as a background job.",
-    "The console invokes the CloudOps agent on Amazon Bedrock AgentCore Runtime (IAM-authorized, outbound "
-    "through the NAT gateway).",
+    "Availability Zones. Each chat turn runs as a background job with a heartbeat.",
+    "The console signs every request. Chat goes to the planner runtime on Amazon Bedrock AgentCore, the only "
+    "component that talks to a model; its IAM role is read-only.",
     "Amazon Nova Micro routes the request to one or two tool domains; Amazon Nova Pro reasons and calls tools. "
-    "Read-only calls run immediately, in the platform or a member account.",
+    "Read-only calls run immediately; listings are complete or flagged as incomplete.",
     "Every call that would change something is intercepted by the approval gate and stored as a pending "
-    "action in Amazon DynamoDB. Nothing changes yet.",
-    "An operator approves the card. The stored call is replayed exactly once (conditional write) with no model "
-    "involved, and the result is written to the audit log.",
-    "Calls in member accounts assume CloudOpsCrossAccountRole with an ExternalId. Only registered accounts "
-    "are allowed; the role can be rolled out with CloudFormation StackSets.",
+    "action in Amazon DynamoDB. Nothing changes, and the planner's role could not change it anyway.",
+    "A second person approves the card. The executor runtime, which has no model, replays the stored call at "
+    "most once and records the result in the audit log and conversation memory.",
+    "In member accounts the planner assumes a read-only role and the executor a change role, each with an "
+    "ExternalId. Only the tenant's registered accounts are allowed.",
     "Every hour, Amazon EventBridge Scheduler runs the learning-loop task, which writes resolved tickets to "
     "Amazon S3 and syncs the Bedrock knowledge base (S3 Vectors) used for future escalations.",
     "Logs and embedded metrics go to Amazon CloudWatch (dashboard and alarms); alarms notify by email "
     "through Amazon SNS.",
-    "scripts/deploy.py deploys two AWS CloudFormation stacks; AWS CodeBuild builds the ARM64 console image "
-    "into Amazon ECR, and the agent package is uploaded to S3.",
+    "scripts/deploy.py, or the GitHub pipeline (staging, evaluation gate, approval, production), deploys two "
+    "AWS CloudFormation stacks; AWS CodeBuild builds the ARM64 console image into Amazon ECR.",
 ]
 
 
@@ -139,10 +139,12 @@ def build() -> str:
     group(500, 160, 1010, 720, "VPC  10.40.0.0/16", "vpc", "network/vpc.png")
     for x1, x2, n in ((518, 755, 1), (765, 995, 2)):
         group(x1, 200, x2, 705, f"Availability Zone {n}", "az")
-        group(x1 + 8, 232, x2 - 8, 420, "Public subnet", "public")
-        group(x1 + 8, 432, x2 - 8, 695, "Private subnet", "private")
-    group(1040, 160, 1295, 720, "Amazon Bedrock AgentCore Runtime", "service")
-    group(1320, 160, 1480, 720, "Amazon Bedrock", "service")
+        group(x1 + 8, 232, x2 - 8, 362, "Public subnet", "public")
+        group(x1 + 8, 374, x2 - 8, 695, "Private subnet", "private")
+    group(1040, 160, 1295, 720, "Amazon Bedrock AgentCore", "service")
+    group(1052, 190, 1283, 462, "Planner · read-only role", "generic")
+    group(1052, 474, 1283, 708, "Executor · change role", "generic")
+    group(1320, 160, 1480, 530, "Amazon Bedrock", "service")
     group(500, 760, 1010, 960, "Data", "generic")
     group(1040, 760, 1480, 960, "Operations", "generic")
     group(500, 980, 1010, 1160, "Identity and security", "generic")
@@ -154,45 +156,49 @@ def build() -> str:
     node(100, 330, "general/users.png", "Operators / SREs", "(browser)")
     node(345, 330, "network/cloudfront.png", "Amazon CloudFront")
     node(345, 490, "security/waf.png", "AWS WAF", "managed rules, rate limit")
-    node(500, 330, "network/internet-gateway.png", size=44)
-    text(458, 287, "Internet gateway", size=11.5, color="#545B64")
-    node(760, 330, "network/elb-application-load-balancer.png", "Application Load", "Balancer")
-    node(900, 330, "network/nat-gateway.png", "NAT gateway")
-    node(590, 560, "compute/fargate.png", "Console task", "React + FastAPI")
-    node(695, 560, "compute/fargate.png", "Learning loop", "task (hourly)")
-    node(880, 560, "compute/fargate.png", "Console task", "React + FastAPI")
-    text(760, 684, "Amazon ECS on AWS Fargate (ARM64) · auto scaling", size=11.5, color="#545B64", italic=True)
+    node(880, 160, "network/internet-gateway.png", size=40)
+    text(908, 150, "Internet gateway", size=11.5, anchor="start", color="#545B64")
+    node(636, 290, "network/nat-gateway.png", "NAT gateway", size=48)
+    node(880, 290, "network/nat-gateway.png", "NAT gateway", size=48)
+    node(760, 440, "network/elb-application-load-balancer.png", "Application Load", "Balancer (internal)")
+    text(600, 429, "CloudFront VPC origin", size=11.5, color="#545B64", italic=True)
+    node(590, 596, "compute/fargate.png", "Console task", "React + FastAPI")
+    node(695, 596, "compute/fargate.png", "Learning loop", "task (hourly)")
+    node(880, 596, "compute/fargate.png", "Console task", "React + FastAPI")
+    text(760, 690, "Amazon ECS on AWS Fargate (ARM64) · auto scaling", size=11.5, color="#545B64", italic=True)
 
-    for i, s in enumerate(["Domain router", "Strands agent loop", "290 AWS tools · 8 domains",
-                           "Approval gate (HITL)", "Per-call account scoping"]):
-        chip(1058, 200 + i * 50, 1277, s)
-    node(1167, 560, "ml/bedrock.png", "CloudOps agent", "Python 3.12 · Strands")
+    for i, s in enumerate(["Domain router", "Strands agent · 288 tools", "Approval gate · memory"]):
+        chip(1066, 218 + i * 42, 1269, s)
+    node(1167, 386, "ml/bedrock.png", "Planner runtime", "talks to the model")
+    node(1167, 552, "ml/bedrock.png", "Executor runtime", "no model")
+    chip(1066, 652, 1269, "Replays approved calls")
 
-    node(1400, 250, "ml/bedrock.png", "Amazon Nova Micro", "domain router")
-    node(1400, 420, "ml/bedrock.png", "Amazon Nova Pro", "reasoning, tool use")
-    node(1400, 590, "ml/bedrock.png", "Knowledge Bases", "on S3 Vectors")
+    node(1400, 230, "ml/bedrock.png", "Amazon Nova Micro", "domain router")
+    node(1400, 345, "ml/bedrock.png", "Amazon Nova Pro", "reasoning, tool use")
+    node(1400, 460, "ml/bedrock.png", "Knowledge Bases", "on S3 Vectors")
 
-    node(578, 840, "database/dynamodb.png", "Amazon DynamoDB", "actions · audit · jobs ·", )
-    text(578, 911, "tickets · accounts · usage", size=11.5, color="#545B64")
-    node(703, 840, "storage/simple-storage-service-s3.png", "Amazon S3", "artifacts, uploads")
-    node(828, 840, "storage/simple-storage-service-s3.png", "Amazon S3", "knowledge docs")
-    node(948, 840, "storage/simple-storage-service-s3.png", "Amazon S3 Vectors", "embeddings")
+    node(578, 835, "database/dynamodb.png", "Amazon DynamoDB", "actions · audit · jobs ·", )
+    text(578, 906, "tickets · accounts · usage ·", size=11.5, color="#545B64")
+    text(578, 921, "conversations", size=11.5, color="#545B64")
+    node(703, 835, "storage/simple-storage-service-s3.png", "Amazon S3", "artifacts, uploads")
+    node(828, 835, "storage/simple-storage-service-s3.png", "Amazon S3", "knowledge docs")
+    node(948, 835, "storage/simple-storage-service-s3.png", "Amazon S3 Vectors", "embeddings")
 
     node(1140, 840, "integration/eventbridge-scheduler.png", "EventBridge", "Scheduler")
     node(1275, 840, "management/cloudwatch.png", "Amazon CloudWatch", "logs · metrics · alarms")
     node(1400, 840, "integration/simple-notification-service-sns.png", "Amazon SNS", "alarm email")
 
     node(578, 1050, "security/cognito.png", "Amazon Cognito", "OIDC · MFA · groups")
-    node(718, 1050, "security/secrets-manager.png", "AWS Secrets Manager", "ExternalId, OIDC, cookie")
-    node(868, 1050, "security/identity-and-access-management-iam.png", "AWS IAM", "least-privilege roles")
+    node(718, 1050, "security/secrets-manager.png", "AWS Secrets Manager", "ExternalId, signing key")
+    node(868, 1050, "security/identity-and-access-management-iam.png", "AWS IAM", "split roles, deny rules")
 
     node(1120, 1050, "management/cloudformation.png", "AWS CloudFormation", "foundation + app stacks")
     node(1260, 1050, "devtools/codebuild.png", "AWS CodeBuild", "ARM64 image")
     node(1400, 1050, "compute/ec2-container-registry.png", "Amazon ECR", "console image")
 
-    node(1640, 560, "security/identity-and-access-management-iam-role.png",
-         "CloudOpsCross-", "AccountRole")
-    text(1640, 633, "(ExternalId · StackSets)", size=11.5, color="#545B64")
+    node(1640, 400, "security/identity-and-access-management-iam-role.png", "Read role", "(ReadOnlyAccess)")
+    node(1640, 560, "security/identity-and-access-management-iam-role.png", "Change role", "(approved changes)")
+    text(1640, 650, "both require an ExternalId", size=11.5, color="#545B64", italic=True)
     for (cx, cy), (rel, lab) in zip(
             [(1795, 400), (1895, 400), (1795, 560), (1895, 560), (1795, 720), (1895, 720)],
             [("compute/ec2.png", "Amazon EC2"), ("compute/lambda.png", "AWS Lambda"),
@@ -204,23 +210,26 @@ def build() -> str:
     # ── Connections ────────────────────────────────────────────────────────
     path([(132, 330), (313, 330)])                                   # users → CloudFront
     path([(345, 395), (345, 458)], arrow=False)                      # CloudFront ↔ WAF
-    path([(377, 330), (476, 330)], arrow=False)                      # CloudFront → IGW
-    path([(522, 330), (728, 330)])                                   # IGW → ALB
-    path([(760, 398), (760, 478), (590, 478), (590, 528)])           # ALB → console AZ1
-    path([(760, 478), (880, 478), (880, 528)])                       # ALB → console AZ2
-    path([(912, 560), (1135, 560)])                                  # console → agent
-    path([(1199, 560), (1305, 560), (1305, 250), (1368, 250)])       # agent → Nova Micro
-    path([(1305, 420), (1368, 420)])                                 # agent → Nova Pro
-    path([(1167, 625), (1167, 735), (578, 735), (578, 808)])         # agent → actions table
-    path([(1167, 735), (1530, 735), (1530, 560), (1606, 560)], color="#E7157B")  # assume role
-    path([(1674, 560), (1736, 560)])                                 # role → resources
-    path([(1140, 808), (1140, 752), (695, 752), (695, 626)], dashed=True)  # scheduler → loop
+    path([(377, 330), (457, 330), (457, 440), (728, 440)])           # CloudFront → VPC origin → ALB
+    path([(760, 508), (760, 530), (590, 530), (590, 564)])           # ALB → console AZ1
+    path([(760, 530), (880, 530), (880, 564)])                       # ALB → console AZ2
+    path([(912, 596), (1025, 596), (1025, 386), (1135, 386)])        # console → planner (chat)
+    path([(1025, 552), (1135, 552)])                                 # console → executor (approvals)
+    path([(1199, 386), (1305, 386), (1305, 230), (1368, 230)])       # planner → Nova Micro
+    path([(1305, 345), (1368, 345)])                                 # planner → Nova Pro
+    path([(1100, 720), (1100, 735), (578, 735), (578, 803)])         # runtimes → actions table
+    path([(1262, 190), (1262, 135), (1640, 135), (1640, 368)], color="#00A4A6")   # planner → read role
+    path([(1199, 552), (1606, 552)], color="#E7157B")                # executor → change role
+    path([(1674, 400), (1736, 400)], color="#00A4A6")                # read role → resources
+    path([(1674, 560), (1736, 560)], color="#E7157B")                # change role → resources
+    path([(1140, 808), (1140, 752), (695, 752), (695, 662)], dashed=True)  # scheduler → loop
     path([(100, 375), (100, 1050), (546, 1050)], dashed=True)        # users → Cognito
 
-    for (cx, cy), n in zip([(100, 720), (190, 330), (625, 330), (675, 478), (1020, 560), (1305, 480),
-                            (870, 735), (610, 800), (1530, 650), (1176, 806), (1311, 806), (1154, 1016)],
+    for (cx, cy), n in zip([(100, 720), (190, 330), (560, 440), (675, 530), (1025, 470), (1305, 290),
+                            (870, 735), (1082, 552), (1450, 135), (1176, 806), (1311, 806), (1154, 1016)],
                            range(1, 13)):
         step(cx, cy, n)
+    step(1520, 552, 9)
 
     out.append("</g>")
 

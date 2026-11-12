@@ -15,14 +15,15 @@ re-run at any time to update the deployment.
 
 | Stack | Contents |
 |---|---|
-| `<app>-foundation` | DynamoDB tables (tickets, audit, actions, accounts, usage, jobs), S3 buckets (artifacts, knowledge), Bedrock knowledge base on S3 Vectors, Cognito user pool with `admin`/`sre`/`operator`/`viewer` groups, generated secrets, ECR repository and a CodeBuild project that builds the console image |
-| `<app>-app` | Bedrock AgentCore Runtime running the agent, VPC (2 AZs, private subnets, 1 NAT gateway), ALB, ECS Fargate console service (React web app + FastAPI, ARM64, auto scaling), CloudFront (HTTPS) with AWS WAF, Cognito app client, hourly learning-loop task, CloudWatch alarms and dashboard |
-| `cloudops-cross-account` (per managed account) | `CloudOpsCrossAccountRole`, which the agent assumes, plus service roles used by code deployments |
+| `<app>-foundation` | DynamoDB tables (tickets, audit, actions, accounts, usage, jobs, conversations), S3 buckets (artifacts, knowledge), Bedrock knowledge base on S3 Vectors, Cognito user pool with `admin`/`sre`/`operator`/`viewer` groups, generated secrets, ECR repository and a CodeBuild project that builds the console image |
+| `<app>-app` | Two Bedrock AgentCore runtimes (a read-only planner that talks to the model, and an executor that runs approved changes), VPC (2 AZs, private subnets, a NAT gateway per AZ), internal ALB behind a CloudFront VPC origin, ECS Fargate console service (React web app + FastAPI, ARM64, auto scaling), CloudFront (HTTPS) with AWS WAF, Cognito app client, hourly learning-loop task, CloudWatch alarms and dashboard |
+| `cloudops-cross-account` (per managed account) | `CloudOpsCrossAccountReadRole` (read-only, for the planner) and `CloudOpsCrossAccountRole` (for the executor), plus service roles used by code deployments |
 
 `<app>` is `cloudops` unless you pass `--app-name`.
 
-**Estimated baseline cost** is about USD 120–160 per month in us-east-1. Most
-of that is the NAT gateway, the ALB, two Fargate tasks and WAF. Bedrock model
+**Estimated baseline cost** is about USD 150–200 per month in us-east-1. Most
+of that is the two NAT gateways, the ALB, two Fargate tasks and WAF
+(`--nat-gateways 1` saves roughly USD 33 a month at the cost of zone resilience). Bedrock model
 tokens and AgentCore runtime usage are billed on top, per request. Check current
 pricing for your region before deploying.
 
@@ -128,7 +129,10 @@ Useful options (run `python scripts/deploy.py --help` for all of them):
 | Option | Default | Meaning |
 |---|---|---|
 | `--platform-access PowerUser\|ReadOnly` | `PowerUser` | What approved changes may do in this account. `ReadOnly` makes the agent inspect-only here. |
-| `--require-separate-approver` | off | The person who requested a change cannot approve it (four-eyes principle). |
+| `--allow-self-approval` | off | By default the person who requested a change cannot approve it; a second person must. Pass this if you are the only user, otherwise you could never approve your own requests. |
+| `--origin private\|public` | `private` | `private`: the load balancer is internal and reached only through a CloudFront VPC origin. `public`: an internet-facing load balancer restricted to CloudFront, for accounts or regions without VPC origins. |
+| `--nat-gateways 1\|2` | `2` | One NAT gateway per Availability Zone, or a single shared one. |
+| `--platform-tenants a,b` | `default` | Tenants allowed to use this (the platform) account. Other tenants only reach the accounts registered for them. |
 | `--daily-request-limit N` | `0` (unlimited) | Agent requests per tenant per day. |
 | `--console-tasks N` | `2` | Minimum number of console tasks. Auto scaling goes up to 6. |
 | `--domain`, `--certificate-arn` | none | Serve the console on your own domain (see Step 8). |
@@ -171,8 +175,14 @@ aws cognito-idp admin-add-user-to-group --user-pool-id <UserPoolId> --username a
 The agent acts on the platform account by default. To let it work in other
 accounts, do the following for each one.
 
-**6a. Get the two values the target role needs.** Both are printed by
-`deploy.py` and shown on the console's **Accounts** page:
+**6a. Get the three values the target roles need.** The console's **Accounts**
+page shows the complete command with them filled in (use that one: tenants
+other than the default have their own ExternalId). They are also printed by
+`deploy.py`:
+
+```bash
+aws cloudformation describe-stacks --stack-name cloudops-app --query "Stacks[0].Outputs[?OutputKey=='PlannerRuntimeRoleArn'].OutputValue" --output text
+```
 
 ```bash
 aws cloudformation describe-stacks --stack-name cloudops-app --query "Stacks[0].Outputs[?OutputKey=='AgentRuntimeRoleArn'].OutputValue" --output text
@@ -182,14 +192,16 @@ aws cloudformation describe-stacks --stack-name cloudops-app --query "Stacks[0].
 aws secretsmanager get-secret-value --secret-id cloudops/cross-account-external-id --query SecretString --output text
 ```
 
-**6b. Deploy the role in the target account.** Use credentials for *that*
+**6b. Deploy the roles in the target account.** Use credentials for *that*
 account:
 
 ```bash
-aws cloudformation deploy --template-file infra/cross_account_role.yaml --stack-name cloudops-cross-account --capabilities CAPABILITY_NAMED_IAM --parameter-overrides AgentRuntimeRoleArn=<role-arn> ExternalId=<external-id> AccessLevel=PowerUser
+aws cloudformation deploy --template-file infra/cross_account_role.yaml --stack-name cloudops-cross-account --capabilities CAPABILITY_NAMED_IAM --parameter-overrides PlannerRuntimeRoleArn=<planner-role-arn> AgentRuntimeRoleArn=<executor-role-arn> ExternalId=<external-id> AccessLevel=PowerUser
 ```
 
-Use `AccessLevel=ReadOnly` for accounts the agent should only inspect.
+This creates two roles. The planner (the part that talks to the model) can only
+assume the read-only one; the executor uses the other to run changes a person
+approved. Use `AccessLevel=ReadOnly` for accounts that should only be inspected.
 
 **To connect many accounts at once**, deploy the same template as a
 CloudFormation StackSet from your AWS Organizations management account (or a
@@ -198,8 +210,8 @@ service-managed permission model and turn on automatic deployment, so new
 accounts get the role too.
 
 **6c. Register the account.** On the console's **Accounts** page, enter the
-account ID and a name, click **Add**, then **Test access**. You should see
-"Connected to <id> as arn:aws:sts::<id>:assumed-role/CloudOpsCrossAccountRole/…".
+account ID and a name, click **Add**, then **Test access**. It checks both roles
+and should report "Read access: Connected…" and "Change access: Connected…".
 
 The agent only assumes roles in registered accounts. Requests that name any
 other account are refused.
@@ -242,6 +254,23 @@ other account are refused.
 
 Pull the new code and re-run `deploy.py` with the same options.
 
+### Upgrading a deployment made before the planner/executor split
+
+One re-deploy and one extra step per connected account:
+
+1. Pull and re-run `deploy.py`. If you are the only user, add `--allow-self-approval`
+   (a second approver is now required by default). The stack update adds the planner
+   runtime, replaces the load balancer with an internal one behind a CloudFront VPC origin
+   (the console URL stays the same; allow 20–30 minutes), and adds a second NAT gateway.
+   If the update fails it rolls back to the previous working state; if the failure is in
+   `ConsoleVpcOrigin`, re-run with `--origin public`.
+2. For each account you connected earlier, re-run the command shown on the console's
+   **Accounts** page with that account's credentials. It updates the existing
+   `cloudops-cross-account` stack and adds the read-only role for the planner. Until you do,
+   the agent can't read that account ("Read access" fails on **Test access**), though
+   approved changes still run.
+3. Sign out and back in.
+
 **Staying current with AWS.** New AWS services, operations and parameters arrive in boto3/botocore
 releases. Every Monday the **Update AWS SDK** GitHub workflow bumps them to the latest release,
 regenerates the agent's dependency lock, runs the tests, template checks and builds, and opens a
@@ -261,6 +290,32 @@ python scripts/update_deps.py
 package and console image are rebuilt only if their contents changed. ECS rolls
 out new console tasks with a circuit breaker that rolls back automatically if
 the new tasks fail health checks.
+
+## Deploy from GitHub instead of a laptop
+
+`.github/workflows/deploy.yml` deploys to **staging**, runs the agent evaluation against the
+real models as a release gate, then waits for approval before **production**. It is idle
+until you configure it:
+
+1. In each target account, create the role the workflow assumes (no AWS keys are stored in
+   GitHub; the role trusts only this repository's `staging` and `production` environments):
+
+```bash
+aws cloudformation deploy --template-file infra/github_oidc_role.yaml --stack-name cloudops-github-deploy --capabilities CAPABILITY_NAMED_IAM --parameter-overrides GitHubOrg=<your-github-user-or-org>
+```
+
+2. In GitHub, under **Settings → Environments**, create `staging` and `production`. On
+   `production`, add **Required reviewers**.
+3. On each environment set the variables `AWS_DEPLOY_ROLE_ARN` (the stack's `DeployRoleArn`
+   output), `AWS_REGION`, and `DEPLOY_ARGS`, for example
+   `--app-name cloudopsstg --environment staging --nat-gateways 1 --console-tasks 1` for
+   staging and `--app-name cloudops --environment prod --alarm-email ops@example.com` for
+   production. Optionally set `EVAL_MIN_SUCCESS` (0–1) on staging to also require a minimum
+   task success rate.
+
+After that, every merge to `main` deploys to staging and evaluates. The gate fails the run
+unless every safety metric (forbidden-tool avoidance, read-only and permission adherence,
+prompt-injection resistance, groundedness, no unsafe executions) is 100%.
 
 ## Evaluating the agent
 
@@ -286,19 +341,26 @@ python evals/run_evals.py --region us-east-1
 
 ## Security model (summary)
 
-- **The model can't change anything by itself.** Every mutating tool call is
-  intercepted and stored as a pending action. Only an approval runs it, and it
-  runs exactly once with the stored arguments, in the stored account and region.
-  No language model is involved in that step. Approvals expire after an hour.
+- **The model can't change anything.** It runs in a planner runtime whose IAM
+  role is read-only. Every mutating tool call is intercepted and stored as a
+  pending action. Only an approval runs it, in a separate executor runtime with
+  no model, at most once, with the stored arguments, in the stored account and
+  region. By default a second person must approve. Approvals expire after an hour.
+- **The platform protects itself.** The executor is denied access to the
+  platform's own users, audit trail, account allow-list, secrets, runtimes and
+  stacks, so an approved change can't be used to gain rights or erase history.
 - **Identity.** Users authenticate with Cognito (OIDC, optional MFA). Their
   role comes from Cognito groups and their tenant from a user attribute they
   can't change themselves. The console keeps the session in a signed, HTTP-only
   cookie and rejects state-changing requests without its custom header (CSRF).
+- **Requests to the agent are signed.** The console signs each one; the agent
+  rejects unsigned, altered or stale requests.
 - **Network.** HTTPS ends at CloudFront, with AWS WAF in us-east-1. The load
-  balancer only accepts CloudFront's IP ranges carrying a secret header. Console
-  tasks run in private subnets.
-- **Cross-account.** Access goes through a role per account that requires an
-  ExternalId, and only accounts on the registry allow-list are used.
+  balancer is internal, reached only through a CloudFront VPC origin, and still
+  requires a secret header. Console tasks run in private subnets.
+- **Cross-account.** Each account has a read-only role for the planner and a
+  change role for the executor, both requiring an ExternalId. Only accounts on
+  the tenant's allow-list are used, and that is re-checked when a change runs.
 - **Data.** All buckets block public access and require TLS. Tables are
   encrypted, with point-in-time recovery. Knowledge-base retrieval is filtered
   by tenant.
@@ -365,5 +427,9 @@ cd web && npm run dev
 
 Set the table, bucket and knowledge-base environment variables from
 [`config.py`](../config.py) to the deployed stacks' outputs, or point
-`AWS_ENDPOINT_URL` at a moto server. Never set `AUTH_MODE=local` on a deployed
-stack.
+`AWS_ENDPOINT_URL` at a moto server. `AUTH_MODE` defaults to `oidc`, and the
+console refuses to start in that mode without complete Cognito settings, so the
+development sign-in only exists where you set `AUTH_MODE=local` yourself. Never
+set it on a deployed stack. Locally, one agent process plays both planner and
+executor (`RUNTIME_MODE=all`) and requests are unsigned (no signing key and
+`CLOUDOPS_ENV=dev`).
