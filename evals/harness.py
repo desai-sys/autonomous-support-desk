@@ -168,6 +168,7 @@ def run_case(case: Case, default_fixtures: dict) -> CaseResult:
     started = time.time()
     with mock.patch.object(ep, "DOMAIN_TOOLS", _stub_domains(ep, recorder, fixtures)), \
             mock.patch.object(ep, "action_store", store), \
+            mock.patch.object(ep, "conversation_store", mock.MagicMock(recent=lambda *a, **k: [])), \
             mock.patch.object(ep, "base_account_id", lambda: PLATFORM_ID), \
             mock.patch.object(ep.router, "route", route), \
             mock.patch.object(ep.usage_meter, "allow_request", lambda tenant: True), \

@@ -15,6 +15,7 @@ from console.jobs import JobStore
 from src.agents.gateway import AgentGateway
 from src.core import tenancy
 from src.core.accounts import AccountRegistry
+from src.core.approvals import describe_results, recorded_results
 from src.core.security import Permission, User, security_manager
 from src.services.app_bundles import AppBundleStore, BundleError
 from src.services.artifact_service import ArtifactService, ArtifactValidationError
@@ -44,9 +45,20 @@ def gateway() -> AgentGateway:
     return AgentGateway()
 
 
+def _recover_approval(meta: dict, owner: str) -> Optional[dict]:
+    """What the record says happened to an approval whose console task was lost."""
+    results = recorded_results(meta.get("action_ids") or [], tenant_id=meta.get("tenant_id", ""),
+                               store=gateway().actions)
+    if results is None:
+        return None                                     # the executor is still running them
+    names = registry().list(meta.get("tenant_id"))
+    label = lambda a: (f"{names[a]['name']} ({a})" if a in names else a) if a else "the platform account"  # noqa: E731
+    return {"response": describe_results(results, label), "results": results, "recovered": True}
+
+
 @lru_cache
 def jobs() -> JobStore:
-    return JobStore()
+    return JobStore(recover={"approve": _recover_approval})
 
 
 @lru_cache
@@ -150,7 +162,8 @@ class Decision(BaseModel):
 def approve(action_id: str, body: Decision, user: User = Depends(require_user)):
     need(user, Permission.APPROVE_CHANGES)
     return {"job_id": jobs().submit(user.user_id, "approve",
-                                    lambda: gateway().approve([action_id], user, body.conversation_id))}
+                                    lambda: gateway().approve([action_id], user, body.conversation_id),
+                                    meta={"action_ids": [action_id], "tenant_id": user.tenant_id})}
 
 
 class BatchDecision(BaseModel):
@@ -163,7 +176,8 @@ def approve_batch(body: BatchDecision, user: User = Depends(require_user)):
     """Approve several actions to run in the given order, stopping at the first failure."""
     need(user, Permission.APPROVE_CHANGES)
     return {"job_id": jobs().submit(user.user_id, "approve", lambda: gateway().approve(
-        body.action_ids, user, body.conversation_id, stop_on_failure=True))}
+        body.action_ids, user, body.conversation_id, stop_on_failure=True),
+        meta={"action_ids": body.action_ids, "tenant_id": user.tenant_id})}
 
 
 @router.post("/actions/{action_id}/reject")

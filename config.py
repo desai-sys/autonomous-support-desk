@@ -100,7 +100,7 @@ ACTION_TTL_SECONDS = _env_int("ACTION_TTL_SECONDS", 3600)
 REQUIRE_SEPARATE_APPROVER = _env_bool("REQUIRE_SEPARATE_APPROVER", True)
 # An approved action still "executing" after this long is marked interrupted
 # (the executor stopped mid-run); it is never retried automatically.
-EXECUTION_TIMEOUT_SECONDS = _env_int("EXECUTION_TIMEOUT_SECONDS", 1800)
+EXECUTION_TIMEOUT_SECONDS = _env_int("EXECUTION_TIMEOUT_SECONDS", 1200)
 
 # ── Cross-account access ──────────────────────────────────────────────────────
 # Role assumed in each managed account (deployment/cross_account_role.yaml).

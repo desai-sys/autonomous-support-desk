@@ -40,7 +40,7 @@ async function runJob<T>(start: Promise<{ job_id: string }>, onTick?: (seconds: 
     const job = await request<{ status: string; result: T & { error?: string } }>(`/api/jobs/${job_id}`);
     if (job.status === "succeeded") return job.result;
     if (job.status === "failed") throw new ApiError(500, job.result?.error ?? "The request failed.");
-    if (Date.now() - started > 20 * 60 * 1000) throw new ApiError(504, "Timed out waiting for the agent.");
+    if (Date.now() - started > 25 * 60 * 1000) throw new ApiError(504, "Timed out waiting for the agent.");
   }
 }
 

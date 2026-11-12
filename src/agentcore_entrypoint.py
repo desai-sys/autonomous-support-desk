@@ -27,8 +27,9 @@ import config
 from src.agents.router import DomainRouter
 from src.core.account_scope import AccountDirectory, scope_tools
 from src.core.accounts import AccountRegistry
-from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating
-from src.core import identity, tenancy
+from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating, describe_results
+from src.core import conversations, identity, tenancy
+from src.core.conversations import ConversationStore, ToolRecorder
 from src.core.aws_clients import base_account_id, boto3, use_account
 from src.core import request_context
 from src.core.monitoring import configure_logging, metrics
@@ -511,6 +512,7 @@ TOOL_REGISTRY = {t.tool_name: t for group in DOMAIN_TOOLS.values() for t in grou
 
 router = DomainRouter(region=config.AWS_REGION)
 action_store = ActionStore()
+conversation_store = ConversationStore()
 account_registry = AccountRegistry()
 
 _ACCOUNT_ID_RE = re.compile(r"\b(\d{12})\b")
@@ -645,17 +647,30 @@ def _chat(payload: dict, caller: dict) -> dict:
     gate = ApprovalGate(action_store, tenant_id=caller["tenant_id"], session_id=session_id,
                         requested_by=caller["user_id"], account_id=None, region=region,
                         directory=directory)
+    # Earlier turns come from the platform's own records (with tool results and what
+    # approved actions returned), not from the text the browser sent, when available.
+    user_message = payload.get("user_message") or prompt
+    records = conversation_store.recent(caller["tenant_id"], payload.get("session_id", ""))
+    remembered = conversations.render(records)
+    if remembered:
+        prompt = f"{remembered}\n\nUser: {user_message}"
+        history = conversations.history_lines(records)
+    recorder = ToolRecorder()
+    gate.companions = [recorder]            # hooks that run alongside the gate in this turn
     domains, tools = ["unknown"], 0
     try:
         response, domains, tools = _resolve_query(
             prompt, payload.get("domain", "auto"), history, notes, gate,
             has_artifact=bool(artifact), read_only=not can_propose, directory=directory,
+            route_text=user_message if remembered else None,
         )
     except Exception as e:
         logger.exception("chat_run_failed")
         response = (f"The request failed: {e}\n\nNothing was changed. Try again, or split the "
                     f"request into smaller steps.")
 
+    conversation_store.record_turn(caller["tenant_id"], payload.get("session_id", ""), user_message,
+                                   response, recorder.calls, gate.queued)
     for action in gate.queued:
         security_manager.log_audit_event(
             caller["user_id"], caller["tenant_id"], "action_proposed", action["summary"], "PENDING",
@@ -741,7 +756,7 @@ def _build_context_notes(artifact, region, read_only: bool = False) -> list:
 
 def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
                    gate: ApprovalGate, has_artifact: bool = False, read_only: bool = False,
-                   directory: AccountDirectory = None):
+                   directory: AccountDirectory = None, route_text: str = None):
     """
     Route the prompt to 1-2 domains, run the agent, and retry once with an extra
     domain if the agent signals it lacked the right tool.
@@ -749,7 +764,7 @@ def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
     Returns (response_text, domains_used, tool_count).
     """
     if domain == "auto" or domain not in DOMAIN_TOOLS:
-        domains = router.route(prompt, history)
+        domains = router.route(route_text or prompt, history)
     else:
         domains = [domain]
 
@@ -807,16 +822,17 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
     if directory is not None:
         tools = scope_tools(tools, directory)
     model = _BUILD_MODEL if "build" in domains else _AGENT_MODEL
+    hooks = [h for h in [gate, *getattr(gate, "companions", [])] if h is not None]
     try:
         result = Agent(model=model, system_prompt=system_prompt, tools=tools,
-                       hooks=[gate], callback_handler=None)(prompt)
+                       hooks=hooks, callback_handler=None)(prompt)
     except Exception as e:
         # Models occasionally emit a malformed tool call when its input is large. Retry once
         # with a fresh agent and a nudge towards smaller calls.
         if "ToolUse" not in str(e) and "invalid sequence" not in str(e):
             raise
         logger.warning("tool_use_stream_error_retry", error=str(e))
-        result = Agent(model=model, tools=tools, hooks=[gate], callback_handler=None,
+        result = Agent(model=model, tools=tools, hooks=hooks, callback_handler=None,
                        system_prompt=system_prompt + (
                            "\n\nYour previous attempt failed because a tool call was malformed. "
                            "Keep every tool call small: one file per call, plain text content."))(prompt)
@@ -854,15 +870,12 @@ def _execute(payload: dict, caller: dict) -> dict:
         approver_role=caller["role"].value, tools=TOOL_REGISTRY, store=action_store, audit=audit,
         stop_on_failure=bool(payload.get("stop_on_failure")), account_allowed=account_allowed,
     )
-    lines = []
     for r in results:
         metrics.action(r["status"])
-        icon = {"succeeded": "✅", "failed": "❌", "skipped": "⏭️"}.get(r["status"], "⚠️")
-        where = f" in {_account_name(r.get('account_id'), caller['tenant_id'])}"
-        detail = r.get("error") or _result_headline(r.get("result"))
-        lines.append(f"{icon} {r.get('summary', r['action_id'])}{where}: {r['status']}"
-                     + (f" — {detail}" if detail else ""))
-    return {"response": "\n".join(lines), "results": results}
+    conversation_store.record_execution(caller["tenant_id"], payload.get("session_id", ""),
+                                        caller["user_id"], results)
+    return {"response": describe_results(results, lambda a: _account_name(a, caller["tenant_id"])),
+            "results": results}
 
 
 def _check_account(payload: dict, caller: dict) -> dict:
@@ -891,23 +904,6 @@ def _account_name(account_id, tenant_id=None) -> str:
     except Exception:
         name = None
     return f"{name} ({account_id})" if name and name != account_id else account_id
-
-
-def _result_headline(result) -> str:
-    """One-line summary of a tool result (deployment manifests and error JSON)."""
-    if not result:
-        return ""
-    try:
-        data = json.loads(result)
-    except (TypeError, ValueError):
-        return str(result)[:300]
-    if not isinstance(data, dict):
-        return str(result)[:300]
-    if data.get("error_message"):
-        return data["error_message"][:300]
-    if data.get("resource_arn"):
-        return data["resource_arn"]
-    return str(data.get("message") or "")[:300]
 
 
 if __name__ == "__main__":

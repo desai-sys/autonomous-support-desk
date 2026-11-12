@@ -764,6 +764,8 @@ Resources:
           Image: !Sub "${ConsoleRepositoryUri}:${ConsoleImageTag}"
           Essential: true
           ReadonlyRootFilesystem: false
+          # Give requests in flight time to finish when a task is replaced.
+          StopTimeout: 120
           PortMappings: [{ContainerPort: 8080, Protocol: tcp}]
           Environment:
             - {Name: CLOUDOPS_ENV, Value: !Ref Environment}
