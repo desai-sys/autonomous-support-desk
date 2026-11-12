@@ -1,4 +1,4 @@
-﻿"""
+"""
 CloudOps platform configuration.
 
 Every value comes from an environment variable so the same code runs locally,
@@ -40,6 +40,11 @@ AUDIT_TABLE = _env("AUDIT_TABLE", "CloudOpsAuditLog")
 ACTIONS_TABLE = _env("ACTIONS_TABLE", "CloudOpsActions")
 ACCOUNTS_TABLE = _env("ACCOUNTS_TABLE", "CloudOpsAccounts")
 JOBS_TABLE = _env("JOBS_TABLE", "CloudOpsJobs")
+CONVERSATIONS_TABLE = _env("CONVERSATIONS_TABLE", "CloudOpsConversations")
+# Identifiers of the platform's own resources (user pool id, runtime names, stack
+# names, ...). The agent refuses to read or change anything that names them; IAM
+# denies on the agent roles enforce the same thing.
+PROTECTED_RESOURCE_NAMES = [n.strip() for n in _env("PROTECTED_RESOURCE_NAMES", "").split(",") if n.strip()]
 
 # ── Knowledge base (RAG over resolved tickets) ────────────────────────────────
 S3_BUCKET_NAME = _env("KB_BUCKET", "")

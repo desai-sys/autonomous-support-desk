@@ -45,3 +45,16 @@ def test_gate_refuses_without_queuing(tables):
     assert len(gate.queued) == 1
     texts = [c["text"] for r in model.tool_results for c in r["content"] if "text" in c]
     assert any(t.startswith("NOT QUEUED") and "overlaps" in t for t in texts)
+
+
+def test_platform_resources_cannot_be_changed(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "PROTECTED_RESOURCE_NAMES", ["us-east-1_Pool"])
+    checks = ProposalChecks()
+    problem = checks.problem("call_aws_api", {"service": "cognito-idp", "operation": "AdminAddUserToGroup",
+                                              "parameters": '{"UserPoolId": "us-east-1_Pool", "GroupName": "admin"}'})
+    assert "CloudOps platform itself" in problem
+    assert "platform" in checks.problem("call_aws_api", {"service": "dynamodb", "operation": "DeleteTable",
+                                                         "parameters": json.dumps({"TableName": config.AUDIT_TABLE})})
+    assert checks.problem("call_aws_api", {"service": "dynamodb", "operation": "DeleteTable",
+                                           "parameters": '{"TableName": "orders"}'}) is None

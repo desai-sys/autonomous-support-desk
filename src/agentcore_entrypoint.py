@@ -513,6 +513,8 @@ action_store = ActionStore()
 account_registry = AccountRegistry()
 
 _ACCOUNT_ID_RE = re.compile(r"\b(\d{12})\b")
+# Viewers get the purpose-built read tools only, not open-ended API access.
+_NOT_FOR_VIEWERS = frozenset({"query_aws_api"})
 _MISSING_TOOL_PHRASES = (
     "don't have a tool", "not available in the current tools", "cannot find a tool",
     "i don't have the capability", "not covered by my tools", "no appropriate tool", "escalate",
@@ -766,7 +768,8 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
     seen, tools = set(), []
     for d in domains:
         for tool_fn in DOMAIN_TOOLS.get(d, []):
-            if id(tool_fn) in seen or (read_only and is_mutating(tool_fn.tool_name)):
+            if id(tool_fn) in seen or (read_only and (is_mutating(tool_fn.tool_name)
+                                                      or tool_fn.tool_name in _NOT_FOR_VIEWERS)):
                 continue
             seen.add(id(tool_fn))
             tools.append(tool_fn)

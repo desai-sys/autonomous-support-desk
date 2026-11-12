@@ -58,7 +58,18 @@ def vpc_cidrs_do_not_overlap(name: str, tool_input: dict, run: "ProposalChecks")
     return None
 
 
-DEFAULT_CHECKS: List[Callable] = [peering_uses_workflow_tool, vpc_cidrs_do_not_overlap]
+def platform_is_off_limits(name: str, tool_input: dict, run: "ProposalChecks") -> Optional[str]:
+    """The agent may not change the platform that controls it (users, audit, its own runtime)."""
+    from src.tools.aws_api_tools import platform_resource_in
+    internal = platform_resource_in(json.dumps(tool_input, default=str))
+    if internal:
+        return (f"{internal} belongs to the CloudOps platform itself (its users, audit trail, approvals "
+                f"or runtime). The agent cannot change it; an administrator must do that directly in AWS.")
+    return None
+
+
+DEFAULT_CHECKS: List[Callable] = [platform_is_off_limits, peering_uses_workflow_tool,
+                                  vpc_cidrs_do_not_overlap]
 
 
 class ProposalChecks:
