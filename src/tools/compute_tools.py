@@ -5,9 +5,7 @@ Covers EC2, Lambda, ECS, EKS, Batch, and Auto Scaling operations.
 
 from src.core.aws_clients import boto3  # account-aware boto3 shim (cross-account support)
 import json
-import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
 from strands import tool
 import structlog
 
@@ -78,7 +76,7 @@ def analyze_ec2_instance(instance_id: str) -> str:
         
         # Analyze security groups
         sg_ids = [sg['GroupId'] for sg in instance['SecurityGroups']]
-        sg_response = ec2.describe_security_groups(GroupIds=sg_ids)
+        ec2.describe_security_groups(GroupIds=sg_ids)
         
         analysis = {
             'instance_id': instance_id,
@@ -277,7 +275,7 @@ def update_lambda_memory(function_name: str, memory_size: int) -> str:
         if not (128 <= memory_size <= 10240):
             return "Memory size must be between 128 and 10240 MB"
         
-        response = lambda_client.update_function_configuration(
+        lambda_client.update_function_configuration(
             FunctionName=function_name,
             MemorySize=memory_size
         )
@@ -297,7 +295,7 @@ def update_lambda_timeout(function_name: str, timeout_seconds: int) -> str:
         if not (1 <= timeout_seconds <= 900):
             return "Timeout must be between 1 and 900 seconds"
         
-        response = lambda_client.update_function_configuration(
+        lambda_client.update_function_configuration(
             FunctionName=function_name,
             Timeout=timeout_seconds
         )
@@ -326,7 +324,7 @@ def invoke_lambda_function(function_name: str, payload: str = "{}") -> str:
             'function_error': response.get('FunctionError')
         }
         
-        return f"Lambda invocation result:\n" + json.dumps(result, indent=2)
+        return "Lambda invocation result:\n" + json.dumps(result, indent=2)
         
     except Exception as e:
         return f"Error invoking Lambda function: {str(e)}"
@@ -342,7 +340,7 @@ def analyze_auto_scaling_group(asg_name: str) -> str:
     try:
         asg_client = boto3.client('autoscaling', region_name='us-east-1')
         ec2 = boto3.client('ec2', region_name='us-east-1')
-        cloudwatch = boto3.client('cloudwatch', region_name='us-east-1')
+        boto3.client('cloudwatch', region_name='us-east-1')
         
         # Get ASG details
         asg_response = asg_client.describe_auto_scaling_groups(
@@ -411,7 +409,7 @@ def create_scaling_policy(asg_name: str, policy_name: str, policy_type: str,
                 }
             }
             
-            response = asg_client.put_scaling_policy(
+            asg_client.put_scaling_policy(
                 AutoScalingGroupName=asg_name,
                 PolicyName=policy_name,
                 PolicyType='TargetTrackingScaling',
@@ -465,7 +463,7 @@ def analyze_ecs_cluster(cluster_name: str) -> str:
         
         # Get container instances
         instances_response = ecs.list_container_instances(cluster=cluster_name)
-        instance_count = len(instances_response['containerInstanceArns'])
+        len(instances_response['containerInstanceArns'])
         
         analysis = {
             'cluster_name': cluster_name,
@@ -489,7 +487,7 @@ def scale_ecs_service(cluster_name: str, service_name: str, desired_count: int) 
     try:
         ecs = boto3.client('ecs', region_name='us-east-1')
         
-        response = ecs.update_service(
+        ecs.update_service(
             cluster=cluster_name,
             service=service_name,
             desiredCount=desired_count
@@ -507,7 +505,7 @@ def restart_ecs_service(cluster_name: str, service_name: str) -> str:
     try:
         ecs = boto3.client('ecs', region_name='us-east-1')
         
-        response = ecs.update_service(
+        ecs.update_service(
             cluster=cluster_name,
             service=service_name,
             forceNewDeployment=True

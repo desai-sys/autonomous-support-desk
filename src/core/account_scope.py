@@ -140,7 +140,7 @@ class AccountScopedTool(AgentTool):
         inner_use = {**tool_use, "input": tool_input}
         # Collect inside the account context so nothing outside the call sees it.
         with use_account(account, self._directory.region), track_truncations() as truncated:
-            events = [event async for event in self._inner.stream(inner_use, invocation_state, **kwargs)]
+            events = [event async for event in self._inner.stream(inner_use, invocation_state, **kwargs)]  # type: ignore[arg-type]
         if truncated:
             _note_incomplete(events, truncated)
         for event in events:

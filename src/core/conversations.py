@@ -146,7 +146,8 @@ def render(records: List[dict], budget: int = _PROMPT_BUDGET) -> Optional[str]:
                       for r in record.get("results", [])]
             lines[-1] += "]"
         blocks.append("\n".join(lines))
-    kept, used = [], 0
+    kept: List[str] = []
+    used = 0
     for block in reversed(blocks):
         if used + len(block) > budget and kept:
             break

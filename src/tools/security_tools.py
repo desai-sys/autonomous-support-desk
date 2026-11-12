@@ -6,7 +6,7 @@ Covers IAM, Secrets Manager, KMS, WAF, GuardDuty, Security Hub, and CloudTrail o
 from src.core.aws_clients import boto3  # account-aware boto3 shim (cross-account support)
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import List
 from strands import tool
 import structlog
 
@@ -191,7 +191,7 @@ def list_iam_users_without_mfa() -> str:
             'users': users_without_mfa
         }
         
-        return f"IAM Users Without MFA:\n" + json.dumps(result, indent=2, default=str)
+        return "IAM Users Without MFA:\n" + json.dumps(result, indent=2, default=str)
         
     except Exception as e:
         return f"Error listing users without MFA: {str(e)}"
@@ -309,7 +309,7 @@ def analyze_kms_key(key_id: str) -> str:
         try:
             policy_response = kms.get_key_policy(KeyId=key_id, PolicyName='default')
             key_policy = json.loads(policy_response['Policy'])
-        except:
+        except Exception:
             key_policy = None
         
         # Get grants
@@ -323,7 +323,7 @@ def analyze_kms_key(key_id: str) -> str:
                     'operations': grant['Operations'],
                     'creation_date': grant['CreationDate'].isoformat()
                 })
-        except:
+        except Exception:
             grants = []
         
         # Get aliases
@@ -463,7 +463,7 @@ def analyze_waf_web_acl(web_acl_name: str, scope: str = "REGIONAL") -> str:
                 if metric_response['Datapoints']:
                     total = sum(dp['Sum'] for dp in metric_response['Datapoints'])
                     metrics[metric_name] = total
-            except:
+            except Exception:
                 metrics[metric_name] = 0
         
         analysis = {
@@ -508,7 +508,7 @@ def create_waf_ip_block_rule(web_acl_name: str, scope: str, ip_addresses: List[s
             ]
         )
         
-        ip_set_id = ip_set_response['Summary']['Id']
+        ip_set_response['Summary']['Id']
         ip_set_arn = ip_set_response['Summary']['ARN']
         
         # Get current Web ACL
@@ -627,7 +627,7 @@ def analyze_guardduty_findings(detector_id: str = None, severity_filter: str = "
             'findings': findings_summary
         }
         
-        return f"GuardDuty Findings Analysis:\n" + json.dumps(analysis, indent=2, default=str)
+        return "GuardDuty Findings Analysis:\n" + json.dumps(analysis, indent=2, default=str)
         
     except Exception as e:
         return f"Error analyzing GuardDuty findings: {str(e)}"

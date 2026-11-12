@@ -89,20 +89,21 @@ def base_account_id() -> Optional[str]:
     return _base_account_id()
 
 
+_UNSET = object()
+_base_account: object = _UNSET
+
+
 def _base_account_id() -> Optional[str]:
     """Account id the runtime itself is running as (cached best-effort)."""
     global _base_account
-    try:
-        return _base_account
-    except NameError:
-        pass
-    try:
-        _base_account = _boto3.client(
-            "sts", region_name=_DEFAULT_REGION
-        ).get_caller_identity()["Account"]
-    except Exception:
-        _base_account = None
-    return _base_account
+    if _base_account is _UNSET:
+        try:
+            _base_account = _boto3.client(
+                "sts", region_name=_DEFAULT_REGION
+            ).get_caller_identity()["Account"]
+        except Exception:
+            _base_account = None
+    return _base_account  # type: ignore[return-value]
 
 
 def _assume_role_credentials(account_id: str) -> dict:
@@ -262,7 +263,7 @@ def get_client(service_name: str, **kwargs):
     """Drop-in replacement for ``boto3.client``: account-aware, and returns complete lists."""
     kwargs = _resolve_region(dict(kwargs))
     account_id = _active_account.get()
-    if _needs_cross_account(account_id):
+    if account_id and _needs_cross_account(account_id):
         creds = _assume_role_credentials(account_id)
         kwargs.setdefault("region_name", _DEFAULT_REGION)
         return _PagingClient(_boto3.client(service_name, **{**creds, **kwargs}))
@@ -284,7 +285,7 @@ def get_resource(service_name: str, **kwargs):
     """Drop-in replacement for ``boto3.resource`` that is account-aware."""
     kwargs = _resolve_region(dict(kwargs))
     account_id = _active_account.get()
-    if _needs_cross_account(account_id):
+    if account_id and _needs_cross_account(account_id):
         creds = _assume_role_credentials(account_id)
         kwargs.setdefault("region_name", _DEFAULT_REGION)
         return _boto3.resource(service_name, **{**creds, **kwargs})

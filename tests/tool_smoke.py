@@ -14,7 +14,6 @@ Used by tests/test_tools/test_all_tools_smoke.py; also runnable directly:
     python tests/tool_smoke.py [tool_name ...]
 """
 
-import inspect
 import io
 import json
 import os

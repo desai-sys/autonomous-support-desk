@@ -74,11 +74,12 @@ def auth_config():
 
 
 if STATIC:
-    app.mount("/assets", StaticFiles(directory=STATIC / "assets"), name="assets")
+    _static: Path = STATIC
+    app.mount("/assets", StaticFiles(directory=_static / "assets"), name="assets")
 
     @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     def spa(path: str):
-        candidate = (STATIC / path).resolve()
-        if path and candidate.is_file() and STATIC.resolve() in candidate.parents:
+        candidate = (_static / path).resolve()
+        if path and candidate.is_file() and _static.resolve() in candidate.parents:
             return FileResponse(candidate)
-        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+        return FileResponse(_static / "index.html", headers={"Cache-Control": "no-cache"})

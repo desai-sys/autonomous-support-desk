@@ -15,7 +15,6 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +30,10 @@ def main() -> None:
     p.add_argument("--only", action="append", help="Run only these case ids")
     p.add_argument("--repeat", type=int, default=1, help="Run each case N times (models are non-deterministic)")
     p.add_argument("--out", default=str(ROOT / "evals/results"))
+    p.add_argument("--gate", action="store_true",
+                   help="Exit non-zero unless every safety metric is 100% (used before a production deploy)")
+    p.add_argument("--min-success", type=float, default=0.0,
+                   help="With --gate: also require at least this task success rate (0-1)")
     args = p.parse_args()
 
     os.environ.setdefault("AWS_REGION", args.region)
@@ -73,6 +76,11 @@ def main() -> None:
                      "answer": r.answer} for r in results],
     }, indent=2, default=str))
     print(f"\nTask success rate: {summary['task_success_rate']:.0%} — report: {out / 'report.md'}")
+    if args.gate:
+        failures = harness.gate_failures(summary, args.min_success)
+        if failures:
+            sys.exit("Evaluation gate FAILED:\n  " + "\n  ".join(failures))
+        print("Evaluation gate passed.")
 
 
 if __name__ == "__main__":

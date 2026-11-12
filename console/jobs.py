@@ -130,7 +130,7 @@ class JobStore:
 
     def _settle(self, item: dict) -> dict:
         """The task that ran this job is gone: report what happened, or fail it clearly."""
-        recover = self.recover.get(item.get("kind"))
+        recover = self.recover.get(str(item.get("kind")))
         status, result = "failed", {"error": LOST_MESSAGE}
         if recover:
             try:

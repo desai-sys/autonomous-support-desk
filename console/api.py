@@ -113,9 +113,10 @@ class ChatRequest(BaseModel):
 
 
 def _chat(user: User, body: ChatRequest) -> dict:
+    result: dict
     if body.mode == "knowledge":
-        res = gateway().query_knowledge_base(body.message, user)
-        result = {"text": res.text, "resolution_type": "knowledge", "escalate": res.escalate,
+        found = gateway().query_knowledge_base(body.message, user)
+        result = {"text": found.text, "resolution_type": "knowledge", "escalate": found.escalate,
                   "pending_actions": [], "metadata": {}}
     else:
         res = gateway().chat(body.message, user, body.conversation_id, history=body.history[-8:],

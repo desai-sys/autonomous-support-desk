@@ -203,7 +203,7 @@ class ApprovalGate(HookProvider):
         if not is_mutating(name):
             return
         tool_input = dict(event.tool_use.get("input") or {})
-        context = dict(self.context)
+        context: dict = dict(self.context)
         if self.directory is not None:
             try:
                 context["account_id"] = self.directory.resolve(tool_input.pop("account", None))
@@ -258,7 +258,7 @@ def execute_actions(action_ids: List[str], *, tenant_id: str, approver: str, app
     store = store or ActionStore()
     results = []
     for action_id in action_ids:
-        entry = {"action_id": action_id}
+        entry: dict = {"action_id": action_id}
         results.append(entry)
         if stop_on_failure and any(r["status"] in (STATUS_FAILED, "error") for r in results[:-1]):
             entry.update(status="skipped", error="Skipped because an earlier step failed; still pending.")

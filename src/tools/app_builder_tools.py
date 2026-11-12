@@ -173,8 +173,9 @@ def _smoke_test(outputs: dict) -> list:
         if not (isinstance(value, str) and value.startswith(("http://", "https://"))):
             continue
         try:
-            req = urllib.request.Request(value, headers={"User-Agent": "CloudOps-smoke-test"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            # Only http(s) URLs reach here (checked above).
+            req = urllib.request.Request(value, headers={"User-Agent": "CloudOps-smoke-test"})  # noqa: S310
+            with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
                 body = resp.read(500).decode("utf-8", "replace")
                 results.append({"output": key, "url": value, "status": resp.status, "body": body})
         except urllib.error.HTTPError as e:

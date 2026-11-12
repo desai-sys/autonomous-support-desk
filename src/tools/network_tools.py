@@ -6,7 +6,7 @@ Covers VPC, Route53, CloudFront, ALB/NLB, API Gateway, and Direct Connect operat
 from src.core.aws_clients import boto3  # account-aware boto3 shim (cross-account support)
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import List
 from strands import tool
 import structlog
 
@@ -457,7 +457,7 @@ def analyze_cloudfront_distribution(distribution_id: str) -> str:
                     total = sum(dp['Sum'] for dp in metric_response['Datapoints'])
                     avg = sum(dp['Average'] for dp in metric_response['Datapoints']) / len(metric_response['Datapoints'])
                     metrics[metric_name] = {'total': total, 'average': avg}
-            except:
+            except Exception:
                 metrics[metric_name] = {'total': 0, 'average': 0}
         
         analysis = {
@@ -589,7 +589,7 @@ def analyze_load_balancer(lb_arn: str) -> str:
                 if metric_response['Datapoints']:
                     latest = max(metric_response['Datapoints'], key=lambda x: x['Timestamp'])
                     metrics[metric_name] = latest
-            except:
+            except Exception:
                 metrics[metric_name] = {'Sum': 0, 'Average': 0}
         
         analysis = {

@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Role that the CloudOps deploy workflow (.github/workflows/deploy.yml) assumes
+  through GitHub's OIDC provider, so deployments need no stored AWS keys. Deploy
+  once in each account you deploy CloudOps to. Only workflow runs for the named
+  repository and GitHub environments can assume it.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub user or organisation that owns the repository.
+  Repository:
+    Type: String
+    Default: autonomous-support-desk
+  Environments:
+    Type: CommaDelimitedList
+    Default: staging,production
+    Description: GitHub environments allowed to assume the role (two entries).
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false if this account already has the token.actions.githubusercontent.com provider.
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudOpsGitHubDeploy
+      Description: Assumed by the CloudOps deploy workflow in GitHub Actions.
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub
+                    - "repo:${GitHubOrg}/${Repository}:environment:${Env}"
+                    - {Env: !Select [0, !Ref Environments]}
+                  - !Sub
+                    - "repo:${GitHubOrg}/${Repository}:environment:${Env}"
+                    - {Env: !Select [1, !Ref Environments]}
+      # Deploying creates IAM roles, Cognito, CloudFront, networking and more, so the
+      # role needs administrator rights. The trust policy above is what limits it:
+      # only this repository's protected environments can use it.
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
+
+Outputs:
+  DeployRoleArn:
+    Description: Set as the AWS_DEPLOY_ROLE_ARN variable on the GitHub environments.
+    Value: !GetAtt DeployRole.Arn

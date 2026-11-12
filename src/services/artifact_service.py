@@ -106,7 +106,7 @@ class ArtifactService:
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchBucket", "NotFound"):
                 raise
-            params = {"Bucket": self.bucket}
+            params: dict = {"Bucket": self.bucket}
             if self.region != "us-east-1":
                 params["CreateBucketConfiguration"] = {"LocationConstraint": self.region}
             self.s3.create_bucket(**params)

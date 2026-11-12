@@ -1186,7 +1186,9 @@ def rollback_lambda_function(function_name: str, target_version: str = '', regio
         # Download the code from the presigned URL and update the function
         try:
             import urllib.request
-            response = urllib.request.urlopen(code_location)
+            if not str(code_location).startswith("https://"):
+                raise ValueError("Unexpected code location returned by Lambda.")
+            response = urllib.request.urlopen(code_location, timeout=60)  # noqa: S310 - https presigned URL
             code_bytes = response.read()
         except Exception as e:
             return json.dumps({

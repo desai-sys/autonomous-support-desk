@@ -25,7 +25,6 @@ import re
 import shlex
 import time
 import zipfile
-from typing import Optional
 
 from botocore.config import Config
 from strands import tool

@@ -58,7 +58,7 @@ _CfnLoader.add_multi_constructor("!", lambda loader, suffix, node: (
 
 def parse_template(template: str) -> dict:
     try:
-        doc = yaml.load(template, Loader=_CfnLoader)
+        doc = yaml.load(template, Loader=_CfnLoader)  # noqa: S506 - _CfnLoader extends SafeLoader
     except yaml.YAMLError as e:
         raise BundleError(f"Template is not valid YAML/JSON: {e}")
     if not isinstance(doc, dict) or not isinstance(doc.get("Resources"), dict) or not doc["Resources"]:

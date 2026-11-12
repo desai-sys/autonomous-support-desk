@@ -72,12 +72,15 @@ class AgentGateway:
 
     @staticmethod
     def _invoke_local(payload: dict) -> dict:
-        request = urllib.request.Request(
+        """Local development: POST to an agent started with `python agent_main.py`."""
+        if not config.AGENT_ENDPOINT_URL.startswith(("http://", "https://")):
+            raise ValueError("AGENT_ENDPOINT_URL must be an http(s) URL.")
+        request = urllib.request.Request(  # noqa: S310 - scheme checked above
             config.AGENT_ENDPOINT_URL.rstrip("/") + "/invocations",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=900) as resp:
+        with urllib.request.urlopen(request, timeout=900) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8") or "{}")
 
     def chat(self, text: str, user: User, session_id: str, history: Optional[List[str]] = None,
@@ -87,8 +90,8 @@ class AgentGateway:
         prompt = text
         if history:
             prompt = "Conversation so far:\n" + "\n".join(history) + f"\n\nUser: {text}"
-        payload = {"mode": "chat", "prompt": prompt, "user_message": text,
-                   "history": history or []}
+        payload: dict = {"mode": "chat", "prompt": prompt, "user_message": text,
+                         "history": history or []}
         if accounts is not None:
             payload["account_ids"] = list(accounts)
         if region:
