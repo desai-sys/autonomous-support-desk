@@ -27,6 +27,8 @@ import time
 from typing import Optional
 
 import boto3 as _boto3
+import jmespath
+from botocore.utils import set_value_from_jmespath
 
 import config
 from config import AWS_REGION as _DEFAULT_REGION
@@ -157,15 +159,114 @@ def _needs_cross_account(account_id: Optional[str]) -> bool:
     return base is None or account_id != base
 
 
+# ---------------------------------------------------------------------------
+# Complete results: follow pagination automatically
+# ---------------------------------------------------------------------------
+# AWS list/describe calls return one page (often 50-100 items). A tool that reads
+# only that page reports a partial list as if it were complete. Clients from this
+# module therefore follow pagination themselves, up to a cap, and record when the
+# cap cut a result short so the tool result can say so.
+
+MAX_AUTO_PAGES = 25
+# Operations that page through stored data rather than resource listings; callers
+# bound these explicitly (time windows, limits), so they keep single-page behaviour.
+_SINGLE_PAGE_OPERATIONS = frozenset({
+    "filter_log_events", "get_log_events", "lookup_events", "scan", "query", "list_objects",
+    "list_objects_v2", "list_object_versions", "list_multipart_uploads", "list_parts",
+    "get_query_results", "get_records", "get_metric_data", "get_cost_and_usage",
+    "get_cost_and_usage_with_resources", "execute_statement", "search_resources",
+})
+
+_truncations: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
+    "cloudops_truncations", default=None)
+
+
+@contextlib.contextmanager
+def track_truncations():
+    """Collect the operations whose results were cut short at the page cap inside the block."""
+    found: list = []
+    token = _truncations.set(found)
+    try:
+        yield found
+    finally:
+        _truncations.reset(token)
+
+
+def _all_pages(client, name: str, method, kwargs: dict):
+    paginator = client.get_paginator(name)
+    cfg = paginator._pagination_cfg
+    as_list = lambda v: [v] if isinstance(v, str) else list(v or [])   # noqa: E731
+    input_tokens, limit_key = as_list(cfg.get("input_token")), cfg.get("limit_key")
+    # A caller that pages or limits explicitly knows what it wants.
+    if any(t in kwargs for t in input_tokens) or (limit_key and limit_key in kwargs):
+        return method(**kwargs)
+
+    merged, pages, more = None, 0, False
+    for page in paginator.paginate(**kwargs):
+        pages += 1
+        if merged is None:
+            merged = page
+        else:
+            for expression in paginator.result_keys:
+                value, existing = expression.search(page), expression.search(merged)
+                if isinstance(value, list) and isinstance(existing, list):
+                    existing.extend(value)
+                elif value is not None and existing is None:
+                    set_value_from_jmespath(merged, expression.expression, value)
+        if pages >= MAX_AUTO_PAGES:
+            more = any(jmespath.search(t, page) for t in as_list(cfg.get("output_token")))
+            break
+    if merged is None:
+        return method(**kwargs)
+    if more:
+        found = _truncations.get()
+        if found is not None:
+            found.append(f"{client.meta.service_model.service_name}:{name}")
+    else:
+        # The result is complete: drop continuation markers so callers don't page again.
+        for token in as_list(cfg.get("output_token")) + ["NextToken", "nextToken", "NextMarker", "Marker"]:
+            if token.isidentifier():
+                merged.pop(token, None)
+        if merged.get("IsTruncated") is True:
+            merged["IsTruncated"] = False
+    return merged
+
+
+class _PagingClient:
+    """A boto3 client whose pageable operations return every page (up to MAX_AUTO_PAGES)."""
+
+    def __init__(self, client):
+        object.__setattr__(self, "_client", client)
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if name.startswith("_") or name in _SINGLE_PAGE_OPERATIONS or not callable(attr):
+            return attr
+        try:
+            pageable = self._client.can_paginate(name)
+        except Exception:
+            pageable = False
+        if not pageable:
+            return attr
+
+        def call(*args, **kwargs):
+            return attr(*args, **kwargs) if args else _all_pages(self._client, name, attr, kwargs)
+        call.__name__ = name
+        return call
+
+    def __setattr__(self, name, value):
+        setattr(self._client, name, value)
+
+
 def get_client(service_name: str, **kwargs):
-    """Drop-in replacement for ``boto3.client`` that is account-aware."""
+    """Drop-in replacement for ``boto3.client``: account-aware, and returns complete lists."""
     kwargs = _resolve_region(dict(kwargs))
     account_id = _active_account.get()
     if _needs_cross_account(account_id):
         creds = _assume_role_credentials(account_id)
         kwargs.setdefault("region_name", _DEFAULT_REGION)
-        return _boto3.client(service_name, **{**creds, **kwargs})
-    return _boto3.client(service_name, **kwargs)
+        return _PagingClient(_boto3.client(service_name, **{**creds, **kwargs}))
+    return _PagingClient(_boto3.client(service_name, **kwargs))
 
 
 def get_base_client(service_name: str, **kwargs):

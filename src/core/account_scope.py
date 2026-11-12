@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, Optional
 from strands.types._events import ToolResultEvent
 from strands.types.tools import AgentTool
 
-from src.core.aws_clients import use_account
+from src.core.aws_clients import track_truncations, use_account
 
 PLATFORM_ALIASES = {"platform", "platform account", "base", "this account", "home"}
 _ID_RE = re.compile(r"^\d{12}$")
@@ -139,10 +139,24 @@ class AccountScopedTool(AgentTool):
             return
         inner_use = {**tool_use, "input": tool_input}
         # Collect inside the account context so nothing outside the call sees it.
-        with use_account(account, self._directory.region):
+        with use_account(account, self._directory.region), track_truncations() as truncated:
             events = [event async for event in self._inner.stream(inner_use, invocation_state, **kwargs)]
+        if truncated:
+            _note_incomplete(events, truncated)
         for event in events:
             yield event
+
+
+def _note_incomplete(events: list, operations: list) -> None:
+    """Tell the model a listing was cut short, so it can't present it as complete."""
+    note = ("NOTE: this result is INCOMPLETE. " + ", ".join(sorted(set(operations)))
+            + " returned more items than the platform reads in one call. Say so, and narrow the "
+              "request (region, filter, name prefix) to see the rest.")
+    for event in reversed(events):
+        result = getattr(event, "tool_result", None)
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            result["content"].append({"text": note})
+            return
 
 
 def scope_tools(tools: Iterable[AgentTool], directory: AccountDirectory) -> list:
