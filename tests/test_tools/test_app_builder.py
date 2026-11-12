@@ -473,3 +473,13 @@ def test_build_requests_use_the_pipeline_and_viewers_cannot_build(tables, monkey
     # A request the builder doesn't handle falls through to the normal agent.
     monkeypatch.setattr(ep.app_builder, "run", lambda *a, **k: None)
     assert ep.invoke({**base, "user": {"id": "alice", "role": "operator"}})["response"] == "agent answered"
+
+
+def test_html_is_read_with_a_real_parser_not_patterns():
+    odd = PAGE.replace("</script>", "</SCRIPT\t\n >").replace("<script>", '<script type="module">')
+    assert check_file("static/index.html", odd, "static-site") == []
+    data_block = PAGE.replace("<body>", '<body><script type="application/json">{"a": [1, 2}</script>')
+    assert check_file("static/index.html", data_block, "static-site") == []       # data, not JavaScript
+    anchors = PAGE.replace("<body>", '<body><a href="#top">top</a><img src="data:image/png;base64,AAAA">')
+    assert check_file("static/index.html", anchors, "static-site") == []
+    assert any("never closed" in m for m in errors("static/index.html", PAGE.replace("</style>", ""), "static-site"))

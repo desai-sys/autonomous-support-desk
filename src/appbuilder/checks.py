@@ -14,7 +14,8 @@ block if it remains, because the JavaScript check is a heuristic.
 import ast
 import re
 import sys
-from typing import List, Tuple
+from html.parser import HTMLParser
+from typing import List, Optional, Tuple
 
 Problem = Tuple[str, str]
 MAX_FILE_BYTES = 200_000
@@ -24,8 +25,8 @@ _PLACEHOLDER = re.compile(
     r"(code|logic|implementation)|your (code|logic) here|implement(ation)? (goes )?here|"
     r"add (your|more) (code|logic) here|same as (before|above)\b.{0,20}$|\.\.\. ?\(?(rest|more|omitted|unchanged))",
     re.I | re.M)
-_LOCAL_REF = re.compile(r"""<(?:script|link|img|audio|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
-_SCRIPT = re.compile(r"<script\b([^>]*)>(.*?)</script\s*>", re.I | re.S)
+_REF_TAGS = {"script": "src", "link": "href", "img": "src", "audio": "src", "source": "src"}
+_DATA_SCRIPT_TYPES = ("application/json", "application/ld+json", "text/template")
 _REGEX_PRECEDERS = set("(,=:[!&|?{};+-*%<>~^")
 _REGEX_KEYWORDS = ("return", "typeof", "case", "in", "of", "do", "else", "void", "delete", "throw", "new")
 
@@ -89,29 +90,69 @@ def _check_python(path: str, source: str) -> List[Problem]:
 
 # ── HTML and inline JavaScript ───────────────────────────────────────────────
 
+class _Page(HTMLParser):
+    """Collects what the checks need from a page, using the real HTML parser."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags: set = set()
+        self.closed: set = set()
+        self.refs: List[str] = []
+        self.scripts: List[str] = []          # inline JavaScript
+        self.unclosed: List[str] = []         # <script>/<style> that never end
+        self._raw: Optional[str] = None       # the raw-text element we are inside
+        self._inline = False
+        self._buffer: List[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = {k: (v or "") for k, v in attrs}
+        self.tags.add(tag)
+        attribute = _REF_TAGS.get(tag)
+        if attribute and attributes.get(attribute):
+            self.refs.append(attributes[attribute].strip())
+        if tag in ("script", "style"):
+            self._raw, self._buffer = tag, []
+            self._inline = (tag == "script" and "src" not in attributes
+                            and attributes.get("type", "").lower() not in _DATA_SCRIPT_TYPES)
+
+    def handle_data(self, data):
+        if self._raw:
+            self._buffer.append(data)
+
+    def handle_endtag(self, tag):
+        self.closed.add(tag)
+        if tag == self._raw:
+            if tag == "script" and self._inline:
+                self.scripts.append("".join(self._buffer))
+            self._raw = None
+
+    def finish(self):
+        self.close()
+        if self._raw:
+            self.unclosed.append(self._raw)
+
+
 def _check_html(path: str, html: str, blueprint: str) -> List[Problem]:
     problems: List[Problem] = []
-    low = html.lower()
-    if "<html" not in low or "<body" not in low:
+    page = _Page()
+    page.feed(html)
+    page.finish()
+    if not {"html", "body"} <= page.tags:
         problems.append(("error", f"{path} must be a complete HTML document with <html> and <body>."))
-    if "</html>" not in low or "</body>" not in low:
+    for tag in page.unclosed:
+        problems.append(("error", f"{path} has a <{tag}> block that is never closed (the file is cut off "
+                                  f"or malformed)."))
+    if not page.unclosed and not {"html", "body"} <= page.closed:
         problems.append(("error", f"{path} is cut off: it has no closing </body></html>. Write the whole file; "
                                   f"if it is too long, simplify the app."))
-    for tag in ("script", "style"):
-        if len(re.findall(rf"<{tag}\b", low)) != len(re.findall(rf"</{tag}\s*>", low)):
-            problems.append(("error", f"{path} has a <{tag}> block that is never closed (the file is cut off "
-                                      f"or malformed)."))
-    for ref in _LOCAL_REF.findall(html):
-        if not re.match(r"^(https?:)?//|^data:|^mailto:|^/api/", ref.strip()):
-            problems.append(("error", f"{path} loads '{ref.strip()[:60]}', a separate file that doesn't exist. "
+    for ref in page.refs:
+        if not re.match(r"^(https?:)?//|^data:|^mailto:|^#|^/api/", ref):
+            problems.append(("error", f"{path} loads '{ref[:60]}', a separate file that doesn't exist. "
                                       f"Put all CSS and JavaScript inline in this one file."))
     if blueprint == "static-site" and re.search(r"""(fetch|XMLHttpRequest)[^;\n]{0,80}["'`]/api/""", html):
         problems.append(("error", f"{path} calls /api/, but this app has no server-side code. Keep all logic "
                                   f"in the browser and use localStorage to remember things."))
-    for attributes, script in _SCRIPT.findall(html):
-        if re.search(r"\bsrc\s*=", attributes) or re.search(r"""type\s*=\s*["'](application/(ld\+)?json|text/template)""",
-                                                             attributes, re.I):
-            continue
+    for script in page.scripts:
         issue = javascript_issue(script)
         if issue:
             problems.append(("soft", f"The JavaScript in {path} looks malformed: {issue}"))
