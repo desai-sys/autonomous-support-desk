@@ -74,6 +74,20 @@ Parameters:
     AllowedValues: ["true", "false"]
   DailyRequestLimitPerTenant: {Type: Number, Default: 0, MinValue: 0}
   ConsoleDesiredCount: {Type: Number, Default: 2, MinValue: 1}
+  OriginAccess:
+    Type: String
+    Default: private
+    AllowedValues: [private, public]
+    Description: >
+      private: the load balancer is internal and reachable only through a CloudFront
+      VPC origin, so console traffic never crosses the public internet unencrypted
+      and the load balancer has no public address. public: an internet-facing load
+      balancer restricted to CloudFront's addresses (the behaviour before VPC origins).
+  NatGateways:
+    Type: Number
+    Default: 2
+    AllowedValues: [1, 2]
+    Description: 2 gives each Availability Zone its own NAT gateway; 1 saves cost but one zone's outage cuts off both.
   AlarmEmail: {Type: String, Default: ""}
   # Optional custom domain (certificate must be in us-east-1 for CloudFront)
   DomainName: {Type: String, Default: ""}
@@ -82,6 +96,8 @@ Parameters:
 Conditions:
   IsPowerUser: !Equals [!Ref PlatformAccountAccess, PowerUser]
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  PrivateOrigin: !Equals [!Ref OriginAccess, private]
+  NatPerZone: !Equals [!Ref NatGateways, 2]
   HasDomain: !And [!Not [!Equals [!Ref DomainName, ""]], !Not [!Equals [!Ref CertificateArn, ""]]]
   # CloudFront web ACLs can only be created in us-east-1.
   CreateWaf: !Equals [!Ref "AWS::Region", us-east-1]
@@ -503,7 +519,8 @@ Resources:
         App: !Ref AppName
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Network — 2 AZs, public subnets for the ALB/NAT, private subnets for tasks
+  # Network — 2 AZs; public subnets hold the NAT gateways, private subnets the
+  # console tasks and (by default) the load balancer
   # ════════════════════════════════════════════════════════════════════════════
   Vpc:
     Type: AWS::EC2::VPC
@@ -586,9 +603,35 @@ Resources:
   PrivateSubnetARoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  # Second zone: its own NAT gateway and route table, so losing one zone doesn't
+  # cut the other off from AWS APIs.
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: NatPerZone
+    DependsOn: GatewayAttachment
+    Properties: {Domain: vpc}
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: NatPerZone
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Condition: NatPerZone
+    Properties: {VpcId: !Ref Vpc}
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Condition: NatPerZone
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
   PrivateSubnetBRoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !If [NatPerZone, !Ref PrivateRouteTableB, !Ref PrivateRouteTable]
 
   # ════════════════════════════════════════════════════════════════════════════
   # Console — ALB (CloudFront-only) → ECS Fargate (ARM64)
@@ -618,8 +661,11 @@ Resources:
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Scheme: internet-facing
-      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      Scheme: !If [PrivateOrigin, internal, internet-facing]
+      Subnets: !If
+        - PrivateOrigin
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - [!Ref PublicSubnetA, !Ref PublicSubnetB]
       SecurityGroups: [!Ref AlbSecurityGroup]
       LoadBalancerAttributes:
         - {Key: idle_timeout.timeout_seconds, Value: "900"}
@@ -628,6 +674,9 @@ Resources:
   ConsoleTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      # Named per origin mode: switching modes replaces the load balancer, and a
+      # target group can't be attached to the old and new one at once.
+      Name: !If [PrivateOrigin, !Sub "${AppName}-console-private", !Sub "${AppName}-console-public"]
       VpcId: !Ref Vpc
       Protocol: HTTP
       Port: 8080
@@ -881,6 +930,22 @@ Resources:
           Statement: {ManagedRuleGroupStatement: {VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList}}
           VisibilityConfig: {SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ip-reputation}
 
+  # CloudFront reaches the internal load balancer through network interfaces it
+  # manages inside the VPC, so the origin has no public address and the hop from
+  # CloudFront stays on AWS's private network.
+  ConsoleVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Condition: PrivateOrigin
+    DependsOn: [Listener, GatewayAttachment]
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${AppName}-console"
+        Arn: !Ref LoadBalancer
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+        OriginSSLProtocols: [TLSv1.2]
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -898,10 +963,14 @@ Resources:
         Origins:
           - Id: console-alb
             DomainName: !GetAtt LoadBalancer.DNSName
-            CustomOriginConfig:
-              OriginProtocolPolicy: http-only
-              OriginReadTimeout: 60
-              OriginKeepaliveTimeout: 60
+            VpcOriginConfig: !If
+              - PrivateOrigin
+              - {VpcOriginId: !GetAtt ConsoleVpcOrigin.Id, OriginReadTimeout: 60, OriginKeepaliveTimeout: 60}
+              - !Ref "AWS::NoValue"
+            CustomOriginConfig: !If
+              - PrivateOrigin
+              - !Ref "AWS::NoValue"
+              - {OriginProtocolPolicy: http-only, OriginReadTimeout: 60, OriginKeepaliveTimeout: 60}
             OriginCustomHeaders:
               - {HeaderName: X-Origin-Verify, HeaderValue: !Ref OriginVerifySecret}
         DefaultCacheBehavior:
