@@ -167,7 +167,7 @@ def build() -> str:
     node(880, 596, "compute/fargate.png", "Console task", "React + FastAPI")
     text(760, 690, "Amazon ECS on AWS Fargate (ARM64) · auto scaling", size=11.5, color="#545B64", italic=True)
 
-    for i, s in enumerate(["Domain router", "Strands agent · 288 tools", "Approval gate · memory"]):
+    for i, s in enumerate(["Domain router", "Strands agent · 285 tools", "Approval gate · memory"]):
         chip(1066, 218 + i * 42, 1269, s)
     node(1167, 386, "ml/bedrock.png", "Planner runtime", "talks to the model")
     node(1167, 552, "ml/bedrock.png", "Executor runtime", "no model")

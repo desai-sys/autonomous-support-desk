@@ -1,7 +1,7 @@
 # CloudOps Command Center
 
 Chat with an AI agent that inspects and operates your AWS accounts. It can
-investigate across 288 AWS tools, deploy code you upload as a zip (Lambda, EC2,
+investigate across 285 AWS tools, deploy code you upload as a zip (Lambda, EC2,
 ECS Fargate, S3 websites), and work across many accounts. **Every change it
 proposes waits for a person to approve the exact call before anything runs.**
 
@@ -27,10 +27,11 @@ proposes waits for a person to approve the exact call before anything runs.**
 - **Deploy uploaded code.** Upload a zip and choose Lambda, an existing or new
   EC2 instance, ECS Fargate, or an S3 static site. The agent inspects it, plans,
   and queues the deployment for approval.
-- **Builds whole applications.** Describe an app ("a URL shortener API with a database") and
-  the agent writes the code and the CloudFormation for it. You review every file on the approval
-  card; one approval deploys it to the chosen account and smoke-tests the live URL. Ask for
-  changes and it ships a new version.
+- **Builds small applications.** Describe an app ("a snake and ladder game", "a todo list my
+  team can share") and the platform picks a tested blueprint, has the model write the page and
+  a small Python file as plain text, checks the result and gets problems fixed. You review every
+  file on the approval card; one approval deploys it and smoke-tests the live URL. Ask for
+  changes and it ships a new version. Designed to work on Amazon Nova Pro.
 - **Learns from people.** Requests the agent can't handle become tickets.
   Resolutions feed a tenant-filtered Bedrock knowledge base every hour.
 - **A console that's a pleasure to use.** A fast React app with dark and light themes, an
@@ -46,8 +47,8 @@ proposes waits for a person to approve the exact call before anything runs.**
 ## Status
 
 What is verified on every commit: the safety guarantees (see
-[docs/EVALUATION.md](docs/EVALUATION.md)), 267 tests at 70% coverage of the application
-code, a smoke run of all 288 tools against simulated AWS, lint with security rules, type
+[docs/EVALUATION.md](docs/EVALUATION.md)), 305 tests at 71% coverage of the application
+code, a smoke run of all 285 tools against simulated AWS, lint with security rules, type
 checks on the core, dependency audits and template validation.
 
 What is not: how often the model picks the right tool has **not** been measured with real
@@ -110,7 +111,7 @@ src/
   core/monitoring.py       JSON logging and CloudWatch EMF metrics
   services/                Tickets, knowledge-base retrieval, code-upload staging
   jobs/learning_loop.py    Hourly knowledge-base sync
-  tools/                   288 AWS tools in eight domains (+ uploaded-zip deployment)
+  tools/                   285 AWS tools in eight domains (+ uploaded-zip deployment)
 console/                   Console API server (FastAPI: Cognito sign-in, JSON API, background jobs)
 web/                       Console web app (React + TypeScript + Tailwind, built into the image)
 infra/                     CloudFormation: foundation.yaml, app.yaml, cross_account_role.yaml, github_oidc_role.yaml

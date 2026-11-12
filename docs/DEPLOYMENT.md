@@ -136,7 +136,7 @@ Useful options (run `python scripts/deploy.py --help` for all of them):
 | `--daily-request-limit N` | `0` (unlimited) | Agent requests per tenant per day. |
 | `--console-tasks N` | `2` | Minimum number of console tasks. Auto scaling goes up to 6. |
 | `--domain`, `--certificate-arn` | none | Serve the console on your own domain (see Step 8). |
-| `--build-model` | same as `--agent-model` | Model for the app builder (writing whole applications). A stronger model such as `us.amazon.nova-premier-v1:0` produces better code. |
+| `--build-model` | same as `--agent-model` | Model the app builder writes code with. The builder is designed to work on Amazon Nova Pro; set this only to compare another model you have access to (the evaluation's build scenarios measure the difference). Nova Premier was retired by AWS in September 2026. |
 | `--app-name` | `cloudops` | Deploy several independent copies side by side. |
 | `--environment` | `prod` | Label used in metrics and the UI. |
 
@@ -266,7 +266,8 @@ One re-deploy and one extra step per connected account:
    `ConsoleVpcOrigin`, re-run with `--origin public`.
 2. For each account you connected earlier, re-run the command shown on the console's
    **Accounts** page with that account's credentials. It updates the existing
-   `cloudops-cross-account` stack and adds the read-only role for the planner. Until you do,
+   `cloudops-cross-account` stack and adds the read-only role for the planner and the
+   `cloudops-generated-app` role that apps from the app builder run as. Until you do,
    the agent can't read that account ("Read access" fails on **Test access**), though
    approved changes still run.
 3. Sign out and back in.

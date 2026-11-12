@@ -13,13 +13,13 @@ at real accounts.*
 CloudOps Command Center is a chat-based operations agent for AWS. You ask it questions ("which
 S3 buckets are public?"), ask it to change things ("stop that instance", "peer these two VPCs
 across accounts"), hand it code to deploy, or describe an application for it to build. It
-investigates with **288 AWS tools** across **eight domains**, works across **many AWS
+investigates with **285 AWS tools** across **eight domains**, works across **many AWS
 accounts in a single conversation**, and **never changes anything until a person approves the
 exact call**. That rule is enforced by IAM and code, not by asking the model nicely: the part of
 the agent that talks to the model has read-only credentials.
 
 It deploys into your own account with one command, signs users in through Amazon Cognito, keeps
-an audit trail of every proposal and execution, and ships with a test suite (267 tests, including
+an audit trail of every proposal and execution, and ships with a test suite (305 tests, including
 a run of every tool) plus a scenario evaluation harness for measuring the agent with your models.
 
 | Command Center | Approving a change |
@@ -75,10 +75,11 @@ Drop a zip into the console and choose Lambda, an existing or new EC2 instance, 
 the archive, detects the runtime and handler, plans, and queues the deployment for approval.
 
 ### Build whole applications
-"Build me a snake and ladder game" or "a URL shortener API with a DynamoDB table": the agent
-writes the code and the CloudFormation, validates it, and shows you **every file** on the
-approval card. One approval deploys it and smoke-tests the live URL. Ask for changes and it
-ships version 2.
+"Build me a snake and ladder game" or "a todo list my team can share": the platform picks a
+tested blueprint, the model writes the page and a small Python file, the platform checks the
+result and has the model fix what it finds, and you see **every file** on the approval card.
+One approval deploys it and smoke-tests the live URL. Ask for changes and it ships version 2.
+Apps stay small on purpose: one page, one short Python file, no sign-in.
 
 ![Reviewing a generated app](screenshots/app-review.png)
 
@@ -125,7 +126,7 @@ A request's life:
 CloudOps combines several well-known agent patterns. Each one solves a specific failure mode.
 
 ### 4.1 Router → specialist (domain routing)
-Giving one model 288 tool schemas is slow, expensive and makes tool choice worse. A small, fast
+Giving one model 285 tool schemas is slow, expensive and makes tool choice worse. A small, fast
 model (Nova Micro) first classifies the request into one or two of eight domains (compute,
 storage, network, database, security, ops, deployment, build), and the reasoning model only sees
 those tools, about 30–65 at a time. Cross-service questions ("the security group of my RDS")
@@ -202,14 +203,24 @@ gated). To avoid relying on the model's possibly outdated memory of AWS, it can 
 the installed AWS SDK: exact operation names, required parameters, types and allowed values. A
 weekly workflow upgrades the SDK, so new AWS APIs arrive automatically.
 
-### 4.6 Generate → validate → review → deploy → verify (app builder)
-For "build me an app", the agent writes one file per tool call (small calls avoid the malformed
-tool calls that large JSON-in-JSON inputs provoke), sets the CloudFormation template and saves a
-draft. The platform validates it (safe paths, size and resource limits; no IAM users or access
-keys, admin policies or `Action: "*"`) and CloudFormation validates the template in the target
-account. Drafts are immutable, numbered versions per tenant. Deployment is a gated action whose
-approval card renders the stored files, so reviewers see exactly what will ship, and the deploy
-step calls the app's URL as a smoke test.
+### 4.6 Plan → write → check → repair → review → deploy (app builder)
+The first version let the agent write code and CloudFormation through tool calls. It failed for
+two reasons. A mid-sized model asked to put hundreds of lines of code inside a JSON tool argument
+often produces a malformed call. And the templates it wrote needed IAM permissions the executor
+deliberately lacks, so most apps could not have deployed anyway.
+
+The rebuilt version gives the model much less to do. A short planning call picks one of three
+**blueprints** (a page, a page with an API and storage, or a scheduled job). Each file is then
+written in its own call as **plain text**, checked statically, and sent back for repair up to
+twice. The platform owns everything else: the tested CloudFormation, the Lambda entry point that
+serves the page and dispatches the API, and a simple `store` so generated code never deals with
+database details. Generated stacks contain **no IAM**: every app runs as one pre-created role
+limited to its logs and its own tables. An app that fails its checks is never offered for
+approval. Versions are immutable, the approval card shows the stored files, and the deploy step
+calls the app's URL as a smoke test.
+
+**Why:** reliability comes from shrinking the model's job to what it does well, and making the
+platform responsible for everything that has to be exactly right.
 
 ### 4.7 Escalate → learn (human feedback and retrieval)
 When the agent lacks a tool or the confidence to act, it says `ESCALATE`. The console then
@@ -231,8 +242,8 @@ templates are policy-checked; and every proposal, approval and execution is audi
 | **Amazon Bedrock AgentCore Runtime** (two: planner and executor) | Hosts the agent (Python 3.12, deployed straight from an S3 code package); one role can only read, the other runs approved changes | Managed, isolated sessions sized for agents; IAM-authorised invocation; no containers or servers to run for the agent |
 | **Strands Agents** | Agent loop, tool definitions, hooks | Hooks (`BeforeToolCallEvent`) make the approval gate a first-class part of the loop |
 | **Amazon Nova Micro** | Domain router | Fast and cheap for a one-word classification |
-| **Amazon Nova Pro** (or `--build-model`) | Reasoning and tool use; app generation | Good tool-use quality per cost; app building can use a stronger model such as Nova Premier |
-| **288 boto3 tools** | Read and change AWS resources | Purpose-built tools encode best practice (e.g. analyse before acting); generic API tools cover the rest |
+| **Amazon Nova Pro** (or `--build-model`) | Reasoning and tool use; app generation | Good tool-use quality per cost; the app builder is designed to work on it |
+| **285 boto3 tools** | Read and change AWS resources | Purpose-built tools encode best practice (e.g. analyse before acting); generic API tools cover the rest |
 | **DynamoDB** (actions, audit, tickets, accounts, usage, jobs, conversations) | State | Serverless and pay-per-request; conditional writes make approvals run at most once; TTLs expire approvals, jobs and counters; point-in-time recovery |
 | **S3** (artifacts, knowledge) | Uploaded zips, agent package, app drafts, knowledge documents | Versioned, encrypted, private, lifecycle-expired uploads |
 | **Bedrock Knowledge Base on S3 Vectors** | Retrieval over past resolutions | Managed retrieval without running a vector database; tenant metadata filter |
@@ -276,7 +287,7 @@ We separate **what must never happen** from **how well it behaves**.
 [EVALUATION.md](EVALUATION.md) has the details.
 
 ### Guarantees: deterministic tests on every commit
-267 automated tests run in CI against mocked AWS (moto), covering 70% of the application code. The safety-critical ones drive a
+305 automated tests run in CI against mocked AWS (moto), covering 71% of the application code. The safety-critical ones drive a
 **real Strands agent** with scripted, deliberately misbehaving models and check that:
 
 - a mutating tool never runs during a chat turn, even if the model calls it;
@@ -284,7 +295,7 @@ We separate **what must never happen** from **how well it behaves**.
 - the planner's role is read-only and each runtime refuses the other's requests;
 - unsigned, altered or stale requests are rejected;
 - open-ended reads can't have side effects or return secrets;
-- every one of the 288 tools runs without a programming error or an invalid API parameter;
+- every one of the 285 tools runs without a programming error or an invalid API parameter;
 - viewers, wrong tenants, expired or rejected actions never execute;
 - if the approval store is down, nothing runs (fail closed);
 - unknown accounts are refused, and dependent cross-account steps stop at the first failure;
@@ -292,7 +303,7 @@ We separate **what must never happen** from **how well it behaves**.
 - tenants can't read each other's data.
 
 ### Behaviour: scenario evaluation with real models
-`evals/run_evals.py` runs 16 scenarios (investigate, change, cross-account, safety, build)
+`evals/run_evals.py` runs 21 scenarios (investigate, change, cross-account, safety, build)
 through the real router, model, approval gate and account scoping. AWS tools are stubbed with
 fixture data, so a run calls only Bedrock and never touches AWS resources. It reports:
 
@@ -354,15 +365,15 @@ as proven in it.
   pipeline uses it as a release gate.
 - **Not yet proven live in its current form.** The first deployment of this version should go
   to a staging environment.
-- **Model capability.** With Nova Pro, small apps and routine operations work well; complex
-  generated applications benefit from a stronger build model.
+- **Generated apps are small by design.** One page and one short Python file, checked but not
+  run before you approve; how often Nova Pro produces a passing app is not measured yet.
 - **Tools are smoke-tested, not verified.** Every tool runs cleanly against simulated AWS;
   only some have their answers checked.
 - **Tenant isolation is logical**, suited to teams of one organisation rather than mutually
   hostile customers. CloudFront to the load balancer is private but not TLS without a custom
   domain.
-- **Generated apps use only the standard library and the AWS SDK**, because dependency packaging
-  isn't built yet.
+- **Generated apps use only the standard library and the AWS SDK**, have no sign-in, and share
+  one execution role per account.
 - **Next:** a queue-backed worker for jobs, plan-then-approve for dependent steps, end-to-end TLS
   with a custom domain, an LLM-as-judge for answer quality, and more one-approval workflows.
 
