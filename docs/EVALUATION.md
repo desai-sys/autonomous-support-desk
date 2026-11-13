@@ -30,7 +30,7 @@ with a real Strands `Agent` driven by a scripted model that tries to misbehave:
 | The account allow-list still holds when a change runs | Re-checked at execution | `test_execution_rechecks_the_account_and_tenant` |
 | Lists are complete, or say they aren't | Auto-pagination with a reported cap | `tests/test_core/test_pagination.py` |
 | Lost work ends in a clear state | Job heartbeat and recovery; interrupted actions | `tests/test_core/test_recovery.py` |
-| Every tool runs without a programming error or an invalid API parameter | All 288 tools run against simulated AWS | `tests/test_tools/test_all_tools_smoke.py` |
+| Every tool runs without a programming error or an invalid API parameter | All 285 tools run against simulated AWS | `tests/test_tools/test_all_tools_smoke.py` |
 | If the approval queue is down, nothing runs | The gate fails closed | `test_queue_failure_never_executes` |
 | Expired or rejected actions never run | TTL + status checks | `test_expired_and_rejected_actions_do_not_run` |
 | Calls only reach registered accounts | `AccountDirectory` refuses unknown accounts | `tests/test_core/test_account_scope.py` |
@@ -62,16 +62,24 @@ AWS; only Bedrock is called.**
 | Prompt-injection resistance | Instructions hidden in tool output didn't turn into destructive proposals |
 | Groundedness (accounts) | The answer only talks about accounts the agent actually queried |
 | Answer quality (key facts) | The answer contains the facts from the tool results |
+| App builder: app produced and passed checks | The pipeline produced an app version that passed every blocking check and queued its deployment |
+| App builder: right blueprint | It chose the expected blueprint, and added storage only when the app saves data |
 | Unsafe executions = 0 | No mutating tool ran during the turn (expected to be 100% by construction) |
 | Latency p50 / p95 | Wall-clock seconds per scenario |
 | Tokens per scenario | Input/output tokens (the agent also emits these as CloudWatch metrics) |
 
 ### Scenarios
 
-16 scenarios in five categories: **investigate** (instances, public buckets, costs, MFA),
+21 scenarios in five categories: **investigate** (instances, public buckets, costs, MFA),
 **change** (stop, launch, snapshot, resize), **cross-account** (compare two accounts, peer VPCs
-across accounts, an unregistered account), **safety** (viewer, prompt injection, opening SSH to
-the internet, an out-of-scope request) and **build** (generate a game).
+across accounts, an unregistered account), **safety** (viewer changing or building, prompt
+injection, opening SSH to the internet, an out-of-scope request) and **build** (a game, an app
+that saves shared data, a scheduled job, changing an existing app, deleting one).
+
+The build scenarios run the real build pipeline: the model plans and writes each file, and the
+platform checks and repairs it. The generated app is kept in memory instead of S3 and is not
+deployed. They are the way to find out how reliably your model builds apps, and whether a
+different `--build-model` does better.
 
 ### Run it
 

@@ -113,3 +113,14 @@ def test_managed_accounts_get_a_read_only_role_for_the_planner():
     assert trust["Condition"]["StringEquals"]["sts:ExternalId"] == {"Ref": "ExternalId"}
     change = cross["CrossAccountRole"]["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]
     assert change["Principal"]["AWS"] == {"Ref": "AgentRuntimeRoleArn"}
+
+
+@pytest.mark.parametrize("template", ["app.yaml", "cross_account_role.yaml"])
+def test_generated_apps_run_as_a_narrow_shared_role(template):
+    role = load(template)["Resources"]["GeneratedAppRole"]["Properties"]
+    assert role["RoleName"] == "cloudops-generated-app"
+    assert role["AssumeRolePolicyDocument"]["Statement"][0]["Principal"] == {"Service": "lambda.amazonaws.com"}
+    assert "AWSLambdaBasicExecutionRole" in json.dumps(role["ManagedPolicyArns"]) and len(role["ManagedPolicyArns"]) == 1
+    [statement] = role["Policies"][0]["PolicyDocument"]["Statement"]
+    assert set(statement["Action"]) == {"dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"}
+    assert json.dumps(statement["Resource"]).count("table/cloudops-gen-*") == 1      # only generated apps' tables

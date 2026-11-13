@@ -87,8 +87,9 @@ RUNTIME_MODE = _env("RUNTIME_MODE", "all")
 AGENT_ENDPOINT_URL = _env("AGENT_ENDPOINT_URL", "")
 AGENT_MODEL_ID = _env("AGENT_MODEL_ID", "us.amazon.nova-pro-v1:0")
 ROUTER_MODEL_ID = _env("ROUTER_MODEL_ID", "us.amazon.nova-micro-v1:0")
-# Model for the app builder (writing whole applications). Empty = AGENT_MODEL_ID.
-# Code generation benefits from a stronger model, e.g. us.amazon.nova-premier-v1:0.
+# Model the app builder writes code with. Empty = AGENT_MODEL_ID. The builder is designed
+# to work on Amazon Nova Pro; point this at another model you have access to if you want
+# to compare (the evaluation's build scenarios measure the difference).
 BUILD_MODEL_ID = _env("BUILD_MODEL_ID", "")
 AGENT_MAX_TOKENS = _env_int("AGENT_MAX_TOKENS", 8192)
 

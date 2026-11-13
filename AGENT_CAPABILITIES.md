@@ -343,19 +343,25 @@ after checking the operation's current parameters with `describe_aws_operation`.
 
 ## Build an Application
 
-Describe what you want; the agent writes the code and infrastructure, you review every file on
-the approval card, and one approval deploys and smoke-tests it.
+Describe what you want. The platform picks a blueprint, the model writes the page and a small
+Python file, the platform checks them and has problems fixed, you review every file on the
+approval card, and one approval deploys and smoke-tests it.
 
 | Action | Sample Query |
 |--------|-------------|
-| New app | "build me a URL shortener API with a DynamoDB table" |
-| New app | "create a webhook receiver that stores JSON payloads in S3 and lists them at GET /items" |
-| Scheduled job | "build a Lambda that checks https://example.com every 5 minutes and alerts my SNS topic if it's down" |
-| Change it | "add a DELETE endpoint to url-shortener" |
-| Remove it | "delete the url-shortener app" |
+| A page or game | "build me a simple snake and ladder game" |
+| A page or tool | "create a tip calculator that splits a bill between people" |
+| An app that saves data | "build a todo list my team can share" |
+| An app that saves data | "build a URL shortener" |
+| Scheduled job | "create a job that checks https://example.com every hour and records whether it was up" |
+| Change it | "make the snake-ladder game work for three players" |
+| List them | "which apps have you built?" |
+| Remove it | "delete the snake-ladder app" |
 
-Generated code uses only the standard library and the AWS SDK, and resources are serverless by
-default (Lambda, API Gateway/function URLs, DynamoDB, S3, SQS, EventBridge).
+Apps are small on purpose: one web page and, if needed, one short Python file. They run on
+Lambda with a public URL (no sign-in), store data only through a built-in store backed by
+DynamoDB, use only the Python standard library and the AWS SDK, and cannot reach other AWS
+services such as S3 or SNS. Larger or more specialised applications are out of scope.
 
 ---
 

@@ -132,3 +132,51 @@ def test_release_gate_blocks_on_any_safety_miss():
     quiet = summary()
     quiet["metrics"]["Permission adherence"] = {"passed": 0, "total": 0}
     assert harness.gate_failures(quiet) == []
+
+
+# ── App-building scenarios run the real build pipeline ───────────────────────
+
+def run_build(monkeypatch, case, fixtures, plan, files):
+    import src.agentcore_entrypoint as ep
+    from tests.test_tools.test_app_builder import ScriptedModel as BuildModel
+    monkeypatch.setattr(ep.app_builder, "TextModel", lambda: BuildModel(plan, files))
+    monkeypatch.setattr(ep.router, "route", lambda q, h=None: ["build"])
+    return harness.run_case(case, fixtures)
+
+
+def test_build_scenarios_score_what_the_pipeline_produced(monkeypatch, scenarios):
+    from tests.test_tools.test_app_builder import API, APP_PAGE, PAGE
+    cases, fixtures = scenarios
+    game = run_build(monkeypatch, cases["build-game"], fixtures,
+                     {"action": "build", "app_id": "snake-ladder", "blueprint": "static-site", "spec": "s"},
+                     {"static/index.html": PAGE})
+    assert game.passed, game.checks
+    assert game.built[0]["blueprint"] == "static-site" and game.queued[0]["tool_name"] == "deploy_generated_app"
+
+    todo = run_build(monkeypatch, cases["build-todo-app"], fixtures,
+                     {"action": "build", "app_id": "todo", "blueprint": "web-app", "spec": "s"},
+                     {"api.py": API, "static/index.html": APP_PAGE})
+    assert todo.passed, todo.checks
+
+    # The wrong blueprint, and an app that fails its checks, are both scored as failures.
+    wrong = run_build(monkeypatch, cases["build-todo-app"], fixtures,
+                      {"action": "build", "app_id": "todo", "blueprint": "static-site", "spec": "s"},
+                      {"static/index.html": PAGE})
+    assert not wrong.passed and wrong.checks["built"] and not wrong.checks["built_blueprint"]
+    broken = run_build(monkeypatch, cases["build-game"], fixtures,
+                       {"action": "build", "app_id": "snake-ladder", "blueprint": "static-site", "spec": "s"},
+                       {"static/index.html": PAGE[:200]})
+    assert not broken.passed and not broken.checks["built"] and not broken.checks["queued"]
+
+
+def test_changing_and_deleting_existing_apps_are_scored(monkeypatch, scenarios):
+    from tests.test_tools.test_app_builder import PAGE
+    cases, fixtures = scenarios
+    changed = run_build(monkeypatch, cases["build-change-existing"], fixtures,
+                        {"action": "modify", "app_id": "dice-roller", "blueprint": "static-site", "spec": "two dice"},
+                        {"static/index.html": PAGE})
+    assert changed.passed, changed.checks
+    assert changed.built[0]["version"] == 2
+    deleted = run_build(monkeypatch, cases["build-delete-app"], fixtures,
+                        {"action": "delete", "app_id": "dice-roller"}, {})
+    assert deleted.passed, deleted.checks

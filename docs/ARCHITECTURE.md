@@ -21,7 +21,7 @@ Regenerate both with `python docs/architecture.py` (needs the dev requirements a
 | Planner | Bedrock AgentCore Runtime `<app>_planner`, **read-only role** | `agent_main.py`, `src/agentcore_entrypoint.py` (`RUNTIME_MODE=planner`) | The only component that talks to a model. Routes each prompt to 1–2 tool domains, runs one Strands agent that reads across accounts, and queues proposed changes. Its role cannot change any resource |
 | Executor | Bedrock AgentCore Runtime `<app>_agent`, change role | same package (`RUNTIME_MODE=executor`) | Runs approved actions exactly as recorded. No model, no chat. The only component with credentials that can change things, and it is denied access to the platform's own resources |
 | Domain router | Inside the planner | `src/agents/router.py` | One Nova Micro call classifies the prompt into domains (compute, storage, network, database, security, ops, deployment, build) |
-| Tools | Both runtimes | `src/tools/` | 288 boto3 tools (186 read-only, 102 that change things). Clients come from `src/core/aws_clients.py`, which makes them account-aware and makes list calls return every page. Every domain also has `list_aws_operations` and `describe_aws_operation` (exact current operation names and parameters from the installed SDK), `query_aws_api` (metadata reads only; data-plane and secret-returning operations refused, secrets redacted; not given to viewers) and `call_aws_api` (any other operation, always approval-gated) |
+| Tools | Both runtimes | `src/tools/` | 285 boto3 tools (183 read-only, 102 that change things). Clients come from `src/core/aws_clients.py`, which makes them account-aware and makes list calls return every page. Every domain also has `list_aws_operations` and `describe_aws_operation` (exact current operation names and parameters from the installed SDK), `query_aws_api` (metadata reads only; data-plane and secret-returning operations refused, secrets redacted; not given to viewers) and `call_aws_api` (any other operation, always approval-gated) |
 | Approval engine | Planner queues, executor runs | `src/core/approvals.py`, `src/core/proposal_checks.py` | Intercepts mutating tool calls, refuses ones known to fail or aimed at the platform itself, stores the rest, and executes approved ones at most once |
 | Identity | Console signs, runtimes verify | `src/core/identity.py` | HMAC signature over every request, so the role and tenant in it can't be forged by something that merely has permission to invoke a runtime |
 | Account registry | DynamoDB `accounts` | `src/core/accounts.py`, `src/core/tenancy.py` | Per-tenant allow-list of accounts; per-tenant ExternalId |
@@ -50,7 +50,7 @@ other than the model's good behaviour:
 The agent follows a **router → specialist → gated tools** pattern.
 
 1. **Route.** Nova Micro picks 1–2 of eight domains (compute, storage, network, database,
-   security, ops, deployment, build), so the model sees about 30–65 tool schemas instead of 288. An attached code upload always adds
+   security, ops, deployment, build), so the model sees about 30–65 tool schemas instead of 285. An attached code upload always adds
    `deployment`. If the reply shows a needed tool was missing, the agent retries
    once with one extra domain.
 2. **Reason.** A Strands `Agent` (Nova Pro) runs with the merged tools, a
@@ -139,30 +139,54 @@ with a message asking the user to resend. Nothing waits forever and nothing is r
 
 ## App builder
 
-"Build me a URL shortener" is routed to the `build` domain. The agent:
+"Build me a snake and ladder game" is routed to the `build` domain and handled by a pipeline
+(`src/appbuilder/`), not by the tool-calling agent. Tool calls carry their arguments as JSON,
+and a mid-sized model asked to put several hundred lines of code inside a JSON string often
+produces a malformed call. So the model is given small, separate jobs and never writes
+infrastructure:
 
-1. Writes the code (under `src/`, standard library + AWS SDK only) and a CloudFormation template
-   that takes `ArtifactBucket`/`ArtifactKey` parameters for the Lambda code location.
-2. Writes the app one file per call with `prepare_app_file`, sets the template with
-   `prepare_app_template`, then calls `prepare_app_bundle` (all read-only for the gate). Small,
-   plain-text tool calls avoid the malformed tool calls that large JSON-in-JSON inputs provoke;
-   if one still happens, the agent retries once. The bundle is validated: safe paths, size
-   limits, at most 40 resources, no IAM users/access keys/Organizations/SSO/account-level
-   resources, no administrator policies or `Action: "*"`. CloudFormation validates the template
-   in the target account. The bundle is stored as an immutable version under
-   `s3://<artifacts>/apps/<tenant>/<app_id>/v<N>/` (manifest, files, template, code.zip).
-   `BUILD_MODEL_ID` (`--build-model`) can give this domain a stronger model than day-to-day
-   operations use.
-3. Calls `deploy_generated_app(app_id, version)`, which the gate queues. The console's approval
-   card renders every file and the template from the stored version, so what you review is
-   exactly what will be deployed.
-4. On approval, the code zip is copied to the target account's staging bucket, the stack
-   `cloudops-app-<app_id>` is created or updated (`CAPABILITY_IAM`, `CAPABILITY_AUTO_EXPAND`; never
-   named IAM), and every URL output is called as a smoke test. The result includes the outputs
-   and the smoke-test responses.
+1. **Plan.** One short JSON answer: build, change or delete; a name; which blueprint; a
+   specification. If the answer is unusable, the platform falls back to sensible defaults.
+2. **Write.** One model call per file, answered as plain text in a code block. Output cut off
+   by the token limit is continued automatically.
+3. **Check.** Static checks, with nothing executed: Python syntax, only standard-library and
+   boto3 imports, the required entry function, complete HTML, no references to files that don't
+   exist, no placeholders, and a heuristic scan of inline JavaScript for cut-off code.
+4. **Repair.** Problems go back to the model with the file, up to two times. If blocking
+   problems remain, the app is **not** stored and nothing is offered for approval.
+5. **Store.** The files, the platform's entry point and the blueprint's template become an
+   immutable version under `s3://<artifacts>/apps/<tenant>/<app_id>/v<N>/`.
+6. **Queue.** `deploy_generated_app(app_id, version)` goes through the approval gate. The card
+   shows every file and the template from the stored version, so what you review is what ships.
 
-Changes produce a new version (`get_generated_app` loads the latest version into the draft → rewrite changed files → `prepare_app_bundle` → deploy). `delete_generated_app`
-(also gated) removes the stack.
+| Blueprint | The model writes | The platform provides |
+|---|---|---|
+| `static-site` | `static/index.html` (one self-contained page) | A Lambda function with a public URL serving the page |
+| `web-app` | `api.py` (`handle(method, path, query, body, store)`), then `static/index.html` written against it | The same, plus API dispatch and, if the code stores data, a DynamoDB table |
+| `scheduled-job` | `job.py` (`run(store)`) | A Lambda function on an EventBridge schedule, plus a table if needed |
+
+Every generated app ships the same entry point (`src/appbuilder/runtime_handler.py`, packaged
+as `handler.py`). It serves files under `static/` (and nothing outside it), dispatches `/api/*`
+to the app's `handle`, returns the app's own errors as JSON, and gives the app a `store` with
+`put`, `get`, `list` and `delete`, so generated code never touches DynamoDB types or table
+design.
+
+**No IAM in generated stacks.** Every app runs as one pre-created role,
+`cloudops-generated-app`, which can only write logs and use DynamoDB tables named
+`cloudops-gen-*`. The app stack creates it in the platform account and the cross-account
+template creates it in managed accounts. Generated code can therefore never be granted more
+than that, and deploying needs no permission to create roles. The trade-off is that apps in
+one account share the role, so one generated app could read another's table.
+
+On approval, the executor copies the code zip to the target account's staging bucket, creates or
+updates the stack `cloudops-gen-<app_id>`, and calls every URL output as a smoke test. Asking
+for a change loads the current files, rewrites them with the same pipeline and queues a new
+version; `delete_generated_app` (also gated) removes the stack.
+
+**Limits.** One page and one short Python file per app; standard library and boto3 only; no
+sign-in (URLs are public), email, file uploads or third-party services; storage is the `store`
+only. How often the model produces an app that passes its checks is measured by the build
+scenarios in the evaluation, and has not been measured yet.
 
 ## Cross-account access
 
@@ -270,6 +294,8 @@ minutes, so the `user` and `tenant_id` fields can be trusted. The planner accept
   of one organisation, not mutually hostile customers, who should get separate deployments.
 - **Behaviour depends on the model.** The guarantees above hold whatever the model does. How
   often it picks the right tool is measured by the evaluation harness, not guaranteed.
+- **Generated apps are checked, not run.** The builder's checks catch broken or incomplete
+  code, not wrong behaviour; the smoke test after deployment only confirms the page loads.
 - **Most tools are smoke-tested, not verified.** Every tool is run against simulated AWS for
   programming errors and invalid parameters. Only the tools with dedicated tests have their
   answers checked.

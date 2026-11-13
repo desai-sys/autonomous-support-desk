@@ -1,12 +1,10 @@
 """
-App builder: the agent writes an application (code + CloudFormation) from a
-description, the operator reviews it on the approval card, and one approval
-deploys it into the target account and smoke-tests it.
+Tools for applications built by the app builder (src/appbuilder).
 
-  prepare_app_file      write one file into the request's draft      (no change to any account)
-  prepare_app_template  set the draft's CloudFormation template       (no change to any account)
-  prepare_app_bundle    validate + store the draft as a new version   (no change to any account)
-  get_generated_app     read a version back into the draft, to iterate on it
+Apps are written by the build pipeline, not through tool calls. These tools
+cover the rest of an app's life:
+
+  get_generated_app     read a version's files and template
   deploy_generated_app  create/update the stack, then call its URL outputs   [approval-gated]
   delete_generated_app  delete the stack                                      [approval-gated]
 """
@@ -29,7 +27,8 @@ from src.tools.deployment_tools import _build_manifest
 
 logger = structlog.get_logger()
 
-STACK_PREFIX = "cloudops-app-"
+# Not "cloudops-app-": that is the platform's own stack, which the executor is denied.
+STACK_PREFIX = "cloudops-gen-"
 _TERMINAL_OK = {"CREATE_COMPLETE", "UPDATE_COMPLETE"}
 _TERMINAL_BAD = {"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED", "UPDATE_ROLLBACK_COMPLETE",
                  "UPDATE_ROLLBACK_FAILED", "DELETE_FAILED", "UPDATE_FAILED"}
@@ -50,102 +49,8 @@ def _stack_name(app_id: str, stack_name: str) -> str:
 
 
 @tool
-def prepare_app_file(app_id: str, path: str, content: str) -> str:
-    """Write ONE file of a generated application into the current draft. Call once per file.
-
-    Changes nothing in any AWS account. Code goes under src/ (zipped as the Lambda package with
-    src/ stripped, so src/app.py has handler "app.handler"); also write a README.md.
-
-    Args:
-        app_id: Short lowercase name, e.g. url-shortener (letters, digits, hyphens).
-        path: File path, e.g. src/app.py or README.md.
-        content: The complete file content.
-
-    Returns:
-        JSON with the files in the draft so far.
-    """
-    path = (path or "").strip()
-    if path.startswith("./"):
-        path = path[2:]
-    if not path or path.startswith("/") or ".." in path.split("/") or "\\" in path:
-        return _fail("invalid_path", f"Unsafe or empty file path {path!r}.")
-    draft = request_context.draft(app_id)
-    draft["files"][path] = content
-    return json.dumps({"status": "success", "app_id": app_id, "files": sorted(draft["files"])})
-
-
-@tool
-def prepare_app_template(app_id: str, template: str) -> str:
-    """Set the CloudFormation template (YAML) of the current draft.
-
-    Changes nothing in any AWS account. The template must declare String parameters
-    ArtifactBucket and ArtifactKey and use them as the Lambda code location.
-
-    Args:
-        app_id: The app's name.
-        template: The complete CloudFormation YAML.
-
-    Returns:
-        JSON confirmation.
-    """
-    request_context.draft(app_id)["template"] = template
-    return json.dumps({"status": "success", "app_id": app_id, "template_chars": len(template)})
-
-
-@tool
-def prepare_app_bundle(app_id: str, description: str, region: str = 'us-east-1') -> str:
-    """Validate the current draft (files + template) and save it as a new reviewable version.
-
-    Changes nothing in any AWS account. Call after prepare_app_file / prepare_app_template;
-    then call deploy_generated_app with the returned version.
-
-    Args:
-        app_id: The app's name.
-        description: One paragraph: what the app does and which resources it creates.
-        region: Region the app will be deployed to (the template is validated there).
-
-    Returns:
-        JSON with app_id, version, file list and warnings, or the validation errors to fix.
-    """
-    draft = request_context.draft(app_id)
-    if not draft["files"] and not draft["template"]:
-        return _fail("empty_draft", "The draft has no files or template.",
-                     "Write each file with prepare_app_file and the template with prepare_app_template first.")
-    template = draft["template"]
-    try:
-        manifest = _store().save(request_context.tenant_id(), app_id, description, dict(draft["files"]),
-                                 template, request_context.user_id())
-    except BundleError as e:
-        return _fail("invalid_bundle", str(e),
-                     "Fix the listed problems with prepare_app_file / prepare_app_template, then call "
-                     "prepare_app_bundle again.")
-    except Exception as e:
-        logger.error("prepare_app_bundle_failed", error=str(e))
-        return _fail("storage_error", f"Could not save the draft: {e}")
-
-    # Ask CloudFormation in the target account whether the template is valid.
-    try:
-        boto3.client("cloudformation", region_name=region).validate_template(TemplateBody=template)
-        validation = "valid"
-    except Exception as e:
-        validation = f"CloudFormation rejected the template: {e}"
-    return json.dumps({
-        "status": "success" if validation == "valid" else "needs_fix",
-        "app_id": manifest["app_id"], "version": manifest["version"], "files": manifest["files"],
-        "warnings": manifest["warnings"], "template_validation": validation,
-        "next_step": (f"Call deploy_generated_app(app_id='{app_id}', version={manifest['version']}, "
-                      f"region='{region}') so the operator can review and approve."
-                      if validation == "valid"
-                      else "Fix the template with prepare_app_template and call prepare_app_bundle again."),
-    })
-
-
-@tool
 def get_generated_app(app_id: str, version: int = 0) -> str:
-    """Read a generated app's files and template (version 0 = latest) and load them into the draft.
-
-    To change an app: call this, rewrite only the files that change with prepare_app_file (and
-    prepare_app_template if needed), then prepare_app_bundle for a new version.
+    """Read a generated app's files and template (version 0 = latest).
 
     Args:
         app_id: The app's name.
@@ -160,10 +65,21 @@ def get_generated_app(app_id: str, version: int = 0) -> str:
         return _fail("not_found", str(e))
     except Exception as e:
         return _fail("storage_error", f"Could not read the app: {e}")
-    draft = request_context.draft(app_id)
-    draft["files"] = dict(files)
-    draft["template"] = template
     return json.dumps({"manifest": manifest, "files": files, "template": template})
+
+
+def _missing_execution_role(region: str) -> str:
+    """Explain how to add the shared execution role if this account doesn't have it ('' if it does)."""
+    from src.appbuilder.blueprints import EXECUTION_ROLE_NAME
+    try:
+        boto3.client("iam", region_name=region).get_role(RoleName=EXECUTION_ROLE_NAME)
+        return ""
+    except Exception as e:
+        if "NoSuchEntity" not in str(e):
+            return ""                       # can't tell (e.g. no iam:GetRole); let CloudFormation decide
+    return (f"This account has no '{EXECUTION_ROLE_NAME}' role, which generated apps run as. In the platform "
+            f"account it is created by scripts/deploy.py; in a connected account, re-run the command shown "
+            f"on the console's Accounts page to update the cross-account stack.")
 
 
 def _smoke_test(outputs: dict) -> list:
@@ -193,9 +109,9 @@ def deploy_generated_app(app_id: str, version: int, stack_name: str = '', region
     Approval-gated: the operator sees the app's files and template before it runs.
 
     Args:
-        app_id: The app's name (from prepare_app_bundle).
+        app_id: The app's name.
         version: The version to deploy.
-        stack_name: CloudFormation stack name; defaults to cloudops-app-<app_id>.
+        stack_name: CloudFormation stack name; defaults to cloudops-gen-<app_id>.
         region: AWS region.
 
     Returns:
@@ -213,6 +129,10 @@ def deploy_generated_app(app_id: str, version: int, stack_name: str = '', region
 
     stack = _stack_name(app_id, stack_name)
     cfn = boto3.client("cloudformation", region_name=region)
+    if manifest.get("blueprint"):
+        missing = _missing_execution_role(region)
+        if missing:
+            return _fail("missing_execution_role", missing, stack_name=stack)
     try:
         account_id = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
         params = []
@@ -294,7 +214,7 @@ def delete_generated_app(app_id: str, stack_name: str = '', region: str = 'us-ea
 
     Args:
         app_id: The app's name.
-        stack_name: Stack name if it is not the default cloudops-app-<app_id>.
+        stack_name: Stack name if it is not the default cloudops-gen-<app_id>.
         region: AWS region.
 
     Returns:

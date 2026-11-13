@@ -33,7 +33,7 @@ jobs:
       - name: Lint Python (correctness and security rules)
         run: ruff check .
       - name: Type-check the platform core
-        run: mypy src/core console src/agents src/services src/jobs config.py
+        run: mypy src/core console src/agents src/services src/jobs src/appbuilder config.py
       - name: Audit Python dependencies for known vulnerabilities
         run: |
           pip-audit -r requirements/agent.lock.txt --no-deps --disable-pip

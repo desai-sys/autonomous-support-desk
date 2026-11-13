@@ -73,6 +73,8 @@ def main() -> None:
                      "calls": [{k: v for k, v in c.items()} for c in r.calls],
                      "queued": [{"tool": q["tool_name"], "input": q["tool_input"], "account": q["account_id"]}
                                 for q in r.queued],
+                     "built": [{k: m.get(k) for k in ("app_id", "version", "blueprint", "uses_store")}
+                               for m in r.built],
                      "answer": r.answer} for r in results],
     }, indent=2, default=str))
     print(f"\nTask success rate: {summary['task_success_rate']:.0%} — report: {out / 'report.md'}")

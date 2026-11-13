@@ -30,6 +30,7 @@ from src.core.accounts import AccountRegistry
 from src.core.approvals import ActionStore, ApprovalGate, execute_actions, is_mutating, describe_results
 from src.core import conversations, identity, tenancy
 from src.core.conversations import ConversationStore, ToolRecorder
+from src.appbuilder import pipeline as app_builder
 from src.core.aws_clients import base_account_id, boto3, use_account
 from src.core import request_context
 from src.core.monitoring import configure_logging, metrics
@@ -180,8 +181,7 @@ from src.tools.deployment_tools import (
 from src.tools.provisioning_tools import launch_ec2_instance
 from src.tools.network_workflow_tools import create_vpc_peering
 from src.tools.app_builder_tools import (
-    delete_generated_app, deploy_generated_app, get_generated_app, prepare_app_bundle,
-    prepare_app_file, prepare_app_template,
+    delete_generated_app, deploy_generated_app, get_generated_app,
 )
 from src.tools.aws_api_tools import (
     call_aws_api, describe_aws_operation, list_aws_operations, query_aws_api,
@@ -279,38 +279,13 @@ DOMAIN_INTROS = {
         "them to approve it, then ask them to request the deployment once the instance is "
         "Online in SSM (check_ec2_ssm_status)."
     ),
+    # Building and changing apps is handled by the build pipeline (src/appbuilder). This prompt
+    # covers the remaining questions about generated apps: inspecting, redeploying, deleting.
     "build": (
-        "You are an AWS application builder. From the operator's description you write a complete, "
-        "working application (code + CloudFormation) and deploy it after their approval.\n"
-        "WORKFLOW:\n"
-        "1. If essential requirements are unclear (what it does, public or private, data to store), ask "
-        "ONE short question with proposed defaults; otherwise just build it.\n"
-        "2. Write the app ONE FILE PER CALL with prepare_app_file (path + full content), set the "
-        "CloudFormation with prepare_app_template, then call prepare_app_bundle. Never put several "
-        "files in one call. Fix any validation errors it returns and call it again.\n"
-        "3. Call deploy_generated_app with the returned app_id and version. It is queued: tell the operator "
-        "what will be created, the estimated cost profile, and that they can review every file on the "
-        "approval card.\n"
-        "4. To change an existing app, call get_generated_app, rewrite only the changed files with "
-        "prepare_app_file, then prepare_app_bundle and deploy the new version.\n"
-        "CONVENTIONS:\n"
-        "- Prefer serverless: Lambda (python3.12 or nodejs20.x), API Gateway HTTP API or a Lambda function "
-        "URL, DynamoDB (PAY_PER_REQUEST), S3, SQS, EventBridge schedules.\n"
-        "- Code goes under src/ and may only use the standard library and the AWS SDK (boto3 / "
-        "@aws-sdk v3) because no dependencies are installed. src/app.py -> Handler: app.handler.\n"
-        "- The template must declare `ArtifactBucket` and `ArtifactKey` String parameters and use "
-        "`Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey}` (or SAM `CodeUri: {Bucket: "
-        "!Ref ArtifactBucket, Key: !Ref ArtifactKey}`).\n"
-        "- Give the function its own execution role with only the permissions it needs (no '*' "
-        "actions, no admin policies, no IAM users). Pass table/bucket names via environment variables.\n"
-        "- Output every URL (e.g. ApiUrl) so it is smoke-tested after deployment; make GET / return "
-        "a useful response.\n"
-        "- Web pages, games and other browser UIs: one Lambda whose GET / returns a single "
-        "self-contained HTML page (inline CSS and JavaScript, Content-Type text/html; all game/UI "
-        "logic runs in the browser), exposed with AWS::Lambda::Url (AuthType NONE, which makes it "
-        "public — say so in the plan) plus the matching AWS::Lambda::Permission "
-        "(lambda:InvokeFunctionUrl, Principal '*', FunctionUrlAuthType NONE). Output the URL as AppUrl.\n"
-        "- Include a README.md explaining endpoints and usage. Keep apps small and readable."
+        "You help with applications this platform generated earlier. Use get_generated_app to read an "
+        "app's files and template, deploy_generated_app to (re)deploy a version, and delete_generated_app "
+        "to remove one. Deploying and deleting are queued for approval. Generated apps run as a shared, "
+        "limited role and are named cloudops-gen-<app_id>."
     ),
 }
 
@@ -481,8 +456,7 @@ for _group in (TOOLS_COMPUTE, TOOLS_STORAGE, TOOLS_NETWORK, TOOLS_DATABASE,
 
 
 TOOLS_BUILD = [
-    prepare_app_file, prepare_app_template, prepare_app_bundle, get_generated_app,
-    deploy_generated_app, delete_generated_app,
+    get_generated_app, deploy_generated_app, delete_generated_app,
     validate_cfn_template, list_aws_operations, describe_aws_operation, query_aws_api, call_aws_api,
     search_resource_by_name, describe_agent_capabilities,
 ]
@@ -653,12 +627,17 @@ def _chat(payload: dict, caller: dict) -> dict:
         history = conversations.history_lines(records)
     recorder = ToolRecorder()
     gate.companions = [recorder]            # hooks that run alongside the gate in this turn
+
+    def build():
+        """Requests to build or change an app go through the build pipeline, not tool calls."""
+        return app_builder.run(user_message, remembered or "", gate, directory, region)
+
     domains, tools = ["unknown"], 0
     try:
         response, domains, tools = _resolve_query(
             prompt, payload.get("domain", "auto"), history, notes, gate,
             has_artifact=bool(artifact), read_only=not can_propose, directory=directory,
-            route_text=user_message if remembered else None,
+            route_text=user_message if remembered else None, builder=build,
         )
     except Exception as e:
         logger.exception("chat_run_failed")
@@ -752,7 +731,7 @@ def _build_context_notes(artifact, region, read_only: bool = False) -> list:
 
 def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
                    gate: ApprovalGate, has_artifact: bool = False, read_only: bool = False,
-                   directory: AccountDirectory = None, route_text: str = None):
+                   directory: AccountDirectory = None, route_text: str = None, builder=None):
     """
     Route the prompt to 1-2 domains, run the agent, and retry once with an extra
     domain if the agent signals it lacked the right tool.
@@ -767,6 +746,11 @@ def _resolve_query(prompt: str, domain: str, history: list, context_notes: list,
     # An attached upload always needs the deployment tools loaded.
     if has_artifact and "deployment" not in domains:
         domains = domains[:1] + ["deployment"]
+
+    if builder is not None and domains[0] == "build" and not has_artifact and not read_only:
+        built = builder()
+        if built is not None:               # None: not something the builder handles
+            return built, ["build"], 0
 
     text, final_domains, tool_count = _run_agent_with_domains(
         prompt, domains, context_notes, gate, read_only, directory
@@ -831,7 +815,7 @@ def _run_agent_with_domains(prompt: str, domains: list, context_notes: list,
         result = Agent(model=model, tools=tools, hooks=hooks, callback_handler=None,
                        system_prompt=system_prompt + (
                            "\n\nYour previous attempt failed because a tool call was malformed. "
-                           "Keep every tool call small: one file per call, plain text content."))(prompt)
+                           "Keep every tool call small and its arguments plain."))(prompt)
     try:
         tokens = result.metrics.accumulated_usage
         request_context.record_usage(tokens.get("inputTokens", 0), tokens.get("outputTokens", 0))

@@ -173,6 +173,10 @@ class ActionStore:
         return item
 
 
+class ProposalRefused(Exception):
+    """A change could not be queued; the message says why and what to do instead."""
+
+
 class ApprovalGate(HookProvider):
     """
     Strands hook that queues mutating tool calls instead of running them.
@@ -198,34 +202,43 @@ class ApprovalGate(HookProvider):
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
         registry.add_callback(BeforeToolCallEvent, self._before_tool_call)
 
-    def _before_tool_call(self, event: BeforeToolCallEvent) -> None:
-        name = event.tool_use.get("name", "")
-        if not is_mutating(name):
-            return
-        tool_input = dict(event.tool_use.get("input") or {})
+    def propose(self, name: str, tool_input: dict) -> dict:
+        """
+        Queue a mutating call for approval and return the stored action. ``tool_input``
+        may carry ``account`` (a name or id), as tool calls from the model do.
+        Raises ProposalRefused if it may not be queued; nothing is ever executed here.
+        """
+        tool_input = dict(tool_input or {})
         context: dict = dict(self.context)
         if self.directory is not None:
             try:
                 context["account_id"] = self.directory.resolve(tool_input.pop("account", None))
             except ValueError as e:
-                event.cancel_tool = f"NOT EXECUTED: {e}"
-                return
+                raise ProposalRefused(f"NOT EXECUTED: {e}") from e
         problem = self.checks.problem(name, tool_input)
         if problem:
             logger.info("action_refused", tool=name, reason=problem)
-            event.cancel_tool = f"NOT QUEUED: {problem}"
-            return
+            raise ProposalRefused(f"NOT QUEUED: {problem}")
         try:
             action = self.store.create(tool_name=name, tool_input=tool_input, **context)
         except Exception as e:  # never fall through to executing the tool
             logger.error("action_queue_failed", tool=name, error=str(e))
-            event.cancel_tool = (
+            raise ProposalRefused(
                 f"NOT EXECUTED: {name} changes resources and could not be queued for approval "
-                f"({e}). Tell the operator the change was not made."
-            )
-            return
+                f"({e}). Tell the operator the change was not made.") from e
         self.queued.append(action)
         logger.info("action_queued", action_id=action["action_id"], tool=name)
+        return action
+
+    def _before_tool_call(self, event: BeforeToolCallEvent) -> None:
+        name = event.tool_use.get("name", "")
+        if not is_mutating(name):
+            return
+        try:
+            action = self.propose(name, event.tool_use.get("input") or {})
+        except ProposalRefused as e:
+            event.cancel_tool = str(e)
+            return
         event.cancel_tool = (
             f"NOT EXECUTED YET: {name} changes resources, so it was queued as action "
             f"{action['action_id']} for operator approval. Explain exactly what it will do and "
